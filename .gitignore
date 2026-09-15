@@ -1,0 +1,33 @@
+﻿.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local/runtime state and validation evidence may contain machine-specific metadata.
+evidence/
+test-workspace/
+state/
+*.sqlite
+*.sqlite3
+*.db
+*.dpapi
+*.log
+
+# Credentials and local configuration.
+.env
+.env.*
+*.pem
+*.key
+*.pfx
+*.p12
+
+# Build/editor/backup output.
+build/
+dist/
+*.egg-info/
+*.bak
+*.bak-*
+CODEX_HANDOFF_LATEST.md

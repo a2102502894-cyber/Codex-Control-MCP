@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+[project]
+name = "codex-control-mcp"
+version = "0.2.0"
+description = "Trusted-owner execution bridge for the official installed Codex runtime"
+requires-python = ">=3.11"
+dependencies = ["mcp==1.30.0", "jsonschema==4.26.0", "playwright==1.62.0", "pywin32==312; sys_platform == 'win32'"]
+[project.optional-dependencies]
+dev = ["pytest>=8,<10"]
+[project.scripts]
+codex-control-mcp = "codex_control_mcp.cli:main"
+[tool.setuptools.packages.find]
+where = ["src"]
+[tool.setuptools.package-data]
+codex_control_mcp = ["*.cjs"]
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+markers = ["integration: requires official Codex on Windows"]
