@@ -4,10 +4,9 @@ Codex-Control-MCP 是本机/远端执行基础设施 MCP。它通过已安装的
 
 ## 当前架构
 
-- **Codex-Control-MCP**：47 个顶层工具。只负责执行基础设施，不内置 DirectorDesk 或 Grok 媒体工具。
-- **DirectorDesk-MCP**：独立 stdio MCP，原 17 个 `director_*` 场景工具通过本机 DirectorDesk `/director` bridge 调用；另加 `director_host_task` 非执行宿主任务接口（合计 18）。它仅 inspect/prepare/get/cancel，不会调用 ChatGPT 原生工具或生成图片，见 `C:\path\to\DirectorDesk-MCP\README.md`。
-- **Grok-MCP**：独立 stdio MCP，3 个媒体工具：`grok_image_generate`、`grok_image_edit`、`grok_video_generate`。
-- **Dynamic MCP**：Codex-Control-MCP 通过 `mcp_manage / mcp_tool_search / mcp_tool_inspect / mcp_tool_call` 按需发现和调用独立 MCP。第三方工具不再静态塞进 Core。
+- **Codex-Control-MCP**：47 个顶层工具，只负责通用执行基础设施，不内置任何 Grok、DirectorDesk 或其他第三方业务/媒体工具。
+- **Dynamic MCP**：通过 `mcp_manage / mcp_tool_search / mcp_tool_inspect / mcp_tool_call` 按需注册、发现和调用独立 MCP。它是通用扩展机制，不代表任何被接入的第三方 MCP 属于本项目功能。
+- **外部 MCP**：Grok-MCP、DirectorDesk-MCP 等均为独立项目，拥有独立源码、版本、运行状态和验收结果；它们的故障或可用性不参与 Codex-Control-MCP 本体的生产可用性判定。
 
 生产公网地址：`https://codex-control.aiwsb.site/mcp`
 
@@ -39,10 +38,7 @@ Codex-Control-MCP 是本机/远端执行基础设施 MCP。它通过已安装的
 
 支持 stdio 与 streamable HTTP。第三方 MCP schema 会缓存，并在调用前用 JSON Schema 校验参数。
 
-当前正式注册：
-
-- `director` → DirectorDesk-MCP，18 tools（17 场景工具 + 1 非执行宿主任务工具）
-- `grok` → Grok-MCP，3 tools
+运行时可以注册任意兼容的外部 MCP。具体注册了哪些服务属于部署环境状态，不属于 Codex-Control-MCP 的静态功能清单。
 
 ### Skill 生命周期
 
@@ -106,41 +102,31 @@ HTTPS 计划任务 `Codex-Control-MCP-HTTPS-OnDemand` 同样使用该 venv 运�
 
 当前 LKG：`%USERPROFILE%\.codex-control-mcp\state\lkg-0.2.0`。
 
-## 独立组件
+## 外部组件边界
 
-### DirectorDesk-MCP
+本仓库不包含 Grok 媒体能力，也不包含 DirectorDesk 业务能力。Grok-MCP、DirectorDesk-MCP 或其他第三方 MCP 即使通过 Dynamic MCP 接入，也始终是独立组件。
 
-源码：`C:\path\to\DirectorDesk-MCP`
+因此：
 
-独立 bridge key：`%USERPROFILE%\.director-desk-mcp\state\bridge.key`。不再依赖旧 `director-desk-gateway` 目录。
-
-### Grok-MCP
-
-源码：`C:\path\to\Grok-MCP`
-
-Grok-MCP 不复制 API Key；通过 `GROK_MCP_CREDENTIAL_PATH` 引用现有 Windows DPAPI 凭据文件，密钥不进入 Dynamic MCP 注册表返回值。
+- 外部 MCP 的 HTTP 错误、模型可用性、媒体生成结果和回归状态，不是 Codex-Control-MCP 的验收项。
+- Codex-Control-MCP 只验收“能否按通用 MCP 协议注册、发现、校验和调用外部工具”，不为外部工具自身业务结果背书。
+- `docs/` 中旧版本验收记录只反映当时版本与当时环境，不应用来覆盖当前 README 的现状说明。
 
 ## 验收基线
 
-2026-09-10 最后回归与当前边界（详细结果以 `evidence/architecture-0.2.0-final.json` 为准，不能只看本表当全绿）：
+当前 Codex-Control-MCP 本体基线：
 
-- Core 非集成回归：240 passed，18 integration deselected
+- Core 非集成回归：242 passed，18 integration deselected
 - Core 顶层工具：47
 - 静态 `grok_*`：0
-- DirectorDesk-MCP：17 tools，`director_read` 实调成功
-- Grok-MCP：3 tools，独立生图实调成功
 - 公网 OAuth metadata/challenge 正常
 - 公网 MCP：47 tools，`bridge_version=0.2.0`
-- Dynamic MCP：director=17 ready，grok=3 ready
-- Grok-MCP 回归：12 passed；DirectorDesk-MCP 回归：1 passed。
 - Recoverable Task、Multi-Host local/MCP/file roundtrip、Skill 生命周期真实生产验收通过；SSH/Docker 只验协议/路由契约，不冒充真实远端执行。
 - Browser 的 start/snapshot/fill/click/press/scroll/navigate/close 已真实通过；测试仅使用隔离页并关闭临时 HTTP server。
 - Proxy PASS 要求官方 Codex command/exec 子进程继承代理，实际 CONNECT 到 `127.0.0.1:7897`，经系统信任库完成 TLS 证书验证并取得 HTTPS 成功响应，不能拿裸 HTTPS 200 推断代理链路。
-- Computer Use 返回成功不等于真实输入成功；失败会撤销旧 verified，type 必须观察到输入后文本才累计已验证动作。本轮发现官方 CUA 的输入/窗口激活问题，不能据此前虚假的计数报 healthy。
-- Grok 改图冷却后仍返回 HTTP 502，状态未知。POST 不自动重放；超时和断连也标为 execution_state_unknown，GET/status 允许有限重试。已保存脱敏上游响应；真实部署源站日志仍缺失，不能推测已经修好。生图/视频历史有效产物保留，不重复消费生成额度。
-- 旧 `director-desk-gateway` 空目录仍被现有 DirectorDesk 工作目录持有，已登记下次 Windows 重启删除；没有为了删空目录重启用户服务。
+- Computer Use 当前可用。此前出现过“工具目录可发现 `computer_snapshot`，但某个 ChatGPT 对话实际执行时插件被禁用”的会话状态；新开 ChatGPT 对话重新挂载工具后，`computer_snapshot` 已真实成功，随后 `computer_click`、`computer_type`、`computer_press` 等直接执行也取得真实回执。该现象按宿主会话工具挂载/刷新问题处理，不再归类为 Computer Use 后端输入或窗口激活缺陷。
 
 ## LKG 与证据范围
 
-`scripts/freeze_source_lkg.py` 可生成独立源码候选、隔离导入核对 0.2.0/47 工具/无静态 Grok 或 Director/默认 8774，并写 UTF-8 manifest 与逐文件 SHA256。默认只生成候选；只有验收范围明确且通过后才使用 `--activate`。快照不包含凭据，不等于把未通过的外部 GUI/Grok 能力认证为通过，`packaging_required=false`。
+`scripts/freeze_source_lkg.py` 可生成独立源码候选、隔离导入核对 0.2.0/47 工具/无静态 Grok 或 Director/默认 8774，并写 UTF-8 manifest 与逐文件 SHA256。默认只生成候选；只有验收范围明确且通过后才使用 `--activate`。快照不包含凭据；外部 MCP 的业务能力不属于本项目 LKG 认证范围，`packaging_required=false`。
 
