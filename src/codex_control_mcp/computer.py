@@ -18,6 +18,8 @@ class OfficialComputer:
         self.ready = threading.Event()
         self.error = None
         self.closed = False
+        self.loop = None
+        self.main_task = None
         self.info = {}
         self.verified = False
         self.verified_operations = set()
@@ -31,11 +33,13 @@ class OfficialComputer:
         )
         self.thread.start()
         if not self.ready.wait(40):
+            self.close()
             raise BridgeError(
                 "capability_unavailable",
                 "Official CUA plugin initialization timed out.",
             )
         if self.error:
+            self.close()
             raise BridgeError("capability_unavailable", self.error)
 
     def _entry(self):
@@ -45,6 +49,8 @@ class OfficialComputer:
             self.error = f"Official CUA plugin stopped ({type(e).__name__})."
             self.ready.set()
         finally:
+            self.closed = True
+            self.ready.set()
             while True:
                 try:
                     item = self.requests.get_nowait()
@@ -71,6 +77,8 @@ class OfficialComputer:
         }}}
 
     async def _run(self):
+        self.loop = asyncio.get_running_loop()
+        self.main_task = asyncio.current_task()
         from mcp import ClientSession, StdioServerParameters, types
         from mcp.client.stdio import stdio_client
 
@@ -372,8 +380,16 @@ class OfficialComputer:
             return result
 
     def close(self):
-        if self.closed:
-            return
-        self.closed = True
-        self.requests.put(None)
+        # Closing is idempotent, but a previous timeout is not proof of exit.
+        if not self.closed:
+            self.closed = True
+            self.requests.put(None)
         self.thread.join(8)
+        if self.thread.is_alive() and self.loop and self.main_task:
+            try:
+                self.loop.call_soon_threadsafe(self.main_task.cancel)
+            except RuntimeError:
+                pass
+            self.thread.join(8)
+        if self.thread.is_alive():
+            raise BridgeError("execution_state_unknown", "桌面控制连接尚未退出；未启动替代连接。")

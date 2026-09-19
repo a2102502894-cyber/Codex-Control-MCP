@@ -13,12 +13,56 @@ from .bridge import Bridge
 from .common import ELICITATION_FORWARDER, atomic_json, utc_now
 from .tools import TOOL_SPECS
 
+PROGRESS_INTERVAL_SECONDS = 5
+
+
+async def execute_with_progress(bridge, context, name, arguments):
+    """Best-effort status; never replay or cancel an action on delivery failure."""
+    progress_token = getattr(context.meta, "progressToken", None)
+    async def notify(progress, message):
+        if progress_token is None:
+            return
+        try:
+            with anyio.move_on_after(1):
+                await context.session.send_progress_notification(
+                    progress_token, progress, message=message,
+                    related_request_id=context.request_id,
+                )
+        except Exception:
+            pass  # A disconnected progress consumer must not replay the action.
+
+    async def heartbeat():
+        elapsed = 0
+        await notify(0, "正在执行工具，请稍候。")
+        while True:
+            await asyncio.sleep(PROGRESS_INTERVAL_SECONDS)
+            elapsed += PROGRESS_INTERVAL_SECONDS
+            await notify(elapsed, f"工具仍在执行，已等待约 {elapsed:g} 秒。")
+
+    task = asyncio.create_task(heartbeat()) if progress_token is not None else None
+    try:
+        return await anyio.to_thread.run_sync(bridge.execute, name, arguments)
+    finally:
+        if task:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
+def tool_metadata(name, oauth_enabled):
+    meta = {
+        "openai/toolInvocation/invoking": "正在释放桌面控制…" if name == "computer_close" else "正在执行，请稍候…",
+        "openai/toolInvocation/invoked": "桌面控制已返回状态" if name == "computer_close" else "已返回执行状态",
+    }
+    if oauth_enabled:
+        meta["securitySchemes"] = [{"type": "oauth2", "scopes": ["control", "offline_access"]}]
+    return meta
+
 
 def make_server(bridge):
     server = Server(
         "Codex-Control-MCP",
         version=__version__,
-        instructions="This server exposes structured command, file, Git, session and diagnostic operations through an installed official Codex runtime. Commands run with the Windows service account's permissions and dangerFullAccess, without a workspace sandbox. The server does not start model or agent turns. Experimental GUI availability is reported by codex_capabilities. Results include execution status, timing and backend evidence.",
+        instructions="Use official Codex runtime operations. Before working, tell the user the next action. exec_command defaults to auto: running is NOT completion. Poll session_read using session_id and next_cursor until a final exit code; report meaningful progress and never resubmit the same command because output is absent. Use computer_close in finally after each desktop workflow; the bridge also releases idle control after 120 seconds. A new workflow needs a fresh snapshot. Commands run as the service account with dangerFullAccess. No model turns are started by this server.",
     )
 
     @server.list_tools()
@@ -28,9 +72,8 @@ def make_server(bridge):
                 name=n,
                 description=s["description"],
                 inputSchema=s["inputSchema"],
-                _meta={"securitySchemes": [{"type": "oauth2", "scopes": ["control", "offline_access"]}]}
-                if bridge.cfg.oauth.get("enabled")
-                else None,
+                _meta=tool_metadata(n, bridge.cfg.oauth.get("enabled")),
+                outputSchema={"type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"], "additionalProperties": True},
                 annotations=types.ToolAnnotations(
                     readOnlyHint=s["readOnlyHint"],
                     destructiveHint=not s["readOnlyHint"],
@@ -76,7 +119,7 @@ def make_server(bridge):
 
         token = ELICITATION_FORWARDER.set(forward_form)
         try:
-            out = await anyio.to_thread.run_sync(bridge.execute, name, arguments)
+            out = await execute_with_progress(bridge, context, name, arguments)
         finally:
             ELICITATION_FORWARDER.reset(token)
         out = dict(out)
@@ -180,13 +223,13 @@ async def run_http(cfg, host=None, port=None):
         allowed_hosts=sorted(hosts),
         allowed_origins=cfg.http.get("allowed_origins", []),
     )
-    # Client-mediated application consent needs an SSE request stream and a
-    # surviving session to route the client's elicitation response back to it.
+    # Progress must travel on the tool request's SSE stream even when application
+    # access is preapproved. Stateful sessions are needed only for elicitation.
     client_consent = cfg.requires_client_elicitation
     manager = StreamableHTTPSessionManager(
         server,
         stateless=not client_consent,
-        json_response=not client_consent,
+        json_response=False,
         security_settings=security,
         max_request_body_size=cfg.http.get("request_limit_bytes", 2097152),
         max_sessions=128,

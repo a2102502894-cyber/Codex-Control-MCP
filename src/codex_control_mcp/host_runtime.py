@@ -133,11 +133,11 @@ class HostManager:
                 argv = self._ssh_prefix(item) + ["powershell", "-NoProfile", "-NonInteractive", "-Command", command]
             else:
                 argv = self._ssh_prefix(item) + ["sh", "-lc", command]
-            return self.bridge._do("exec_command", {"argv": argv, "timeout_ms": 120000})
+            return self.bridge._do("exec_command", {"argv": argv, "timeout_ms": 120000, "execution_mode": "buffered"})
         if item["transport"] == "docker":
             shell = "powershell" if item.get("platform") == "windows" else "sh"
             shell_args = ["-NoProfile", "-NonInteractive", "-Command", command] if shell == "powershell" else ["-lc", command]
-            return self.bridge._do("exec_command", {"argv": ["docker", "exec", item["container"], shell, *shell_args], "timeout_ms": 120000})
+            return self.bridge._do("exec_command", {"argv": ["docker", "exec", item["container"], shell, *shell_args], "timeout_ms": 120000, "execution_mode": "buffered"})
         raise BridgeError("host_transport_error", "Remote command transport is not shell based.")
 
     def status(self, name):
@@ -170,7 +170,7 @@ class HostManager:
 
     def exec(self, args):
         item = self._get(args.get("host"))
-        forwarded = {k: v for k, v in args.items() if k in {"command", "argv", "cwd", "shell", "wsl_distribution", "wsl_cwd", "env", "timeout_ms", "output_limit_bytes", "execution_mode", "tty"}}
+        forwarded = {k: v for k, v in args.items() if k in {"command", "argv", "cwd", "shell", "wsl_distribution", "wsl_cwd", "env", "timeout_ms", "output_limit_bytes", "execution_mode", "yield_time_ms", "tty"}}
         if item["transport"] == "local":
             return {"host": "local", "route": "official_codex_runtime", "result": self.bridge._do("exec_command", forwarded)}
         if item["transport"] == "mcp":

@@ -113,7 +113,9 @@ def test_http_consent_roundtrip_and_session_principal_isolation(tmp_path, monkey
                                 assert response.status_code in {404, 414}
                             result = await client.call_tool('computer_snapshot', {})
                             assert result.structuredContent['result']['action'] == action
-                            assert len((await client.list_tools()).tools) == 39
+                            tools = (await client.list_tools()).tools
+                            assert len(tools) == 40  # Adds the explicit Computer Use release tool.
+                            assert any(t.name == 'computer_close' for t in tools)
 
     asyncio.run(exercise())
     assert len(received) == 1

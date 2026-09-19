@@ -51,7 +51,8 @@ EXEC = {
     "env": {"type": "object", "additionalProperties": {"type": ["string", "null"]}},
     "timeout_ms": integer(1, 86400000),
     "output_limit_bytes": integer(1024, 4194304),
-    "execution_mode": enum("buffered", "session"),
+    "execution_mode": enum("auto", "buffered", "session"),
+    "yield_time_ms": integer(0, 10000),
     "tty": B,
 }
 SESSION = {**EXEC, "timeout_ms": integer(0, 86400000)}
@@ -65,7 +66,7 @@ TOOL_SPECS = {
         "返回真实安装、已验证能力、实验能力和不可用原因。", {}, read=True
     ),
     "exec_command": definition(
-        "通过官方 command/exec 执行调用方提供的 command 或 argv，使用 dangerFullAccess，无工作区沙箱。权限与服务进程相同；命令可能修改文件、运行程序或访问网络。返回退出码、stdout、stderr 及执行后端。",
+        "执行 command 或 argv。默认 auto 最多等待约 1 秒，未完成时返回 session_id、已有输出和 next_cursor；必须继续 session_read 并向用户报告进度，直到取得最终退出码，禁止重发原命令。buffered 显式等待结束；session 立即返回。yield_time_ms 只控制本次等待，timeout_ms 控制进程期限。使用 dangerFullAccess，命令可能修改文件或访问网络。",
         EXEC,
     ),
     "session_start": definition(
@@ -392,12 +393,13 @@ GUI_SPECS = {
         ("snapshot_id", "x", "y", "delta_y"),
     ),
     "computer_wait": ({"milliseconds": integer(1, 10000)}, ("milliseconds",)),
+    "computer_close": ({}, ()),
 }
 for name, (props, req) in GUI_SPECS.items():
     TOOL_SPECS[name] = definition(
         ("通过配置的 Browser 后端控制本项目专属浏览器页面。Tabbit 后端使用 Playwright，不调用浏览器内置 AI。先 browser_start，再从 browser_snapshot 返回的 elements 选 element_index；点击、输入、按键、滚动必须提交该页最新 snapshot_id，操作后旧快照失效。坐标单位为视口 CSS 像素；screenshot=true 返回页面截图。browser_close 只关闭本桥页面。"
          if name.startswith('browser_') else
-         "官方 Computer Use 桌面适配器。必须使用新鲜窗口快照和已获得授权的官方直接执行路径。"),
+         "官方 Computer Use 桌面适配器。必须使用新鲜窗口快照和已授权的官方路径。完成本轮桌面操作后必须调用 computer_close 释放控制；空闲 120 秒自动释放。关闭后旧快照失效，下次先重新截图。computer_close 只关闭本桥的控制连接，不关闭用户应用。"),
         props,
         req,
         name.endswith("_snapshot"),

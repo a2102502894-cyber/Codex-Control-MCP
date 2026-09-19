@@ -312,6 +312,18 @@ def run(config_path: Path) -> int:
         report["old_pid"] = old_pid
         if report["operation"] == "recover" and old_pid:
             healthy, detail = verify_service(config, old_pid)
+            if not healthy:
+                # A healthy, explicitly configured older fallback must not be
+                # restarted repeatedly just because the preferred version rose.
+                for candidate in config["candidates"]:
+                    if "expected_version" not in candidate:
+                        continue
+                    fallback_config = {**config,
+                        "expected_version": candidate["expected_version"],
+                        "expected_tool_count": candidate.get("expected_tool_count", config.get("expected_tool_count", 47))}
+                    healthy, detail = verify_service(fallback_config, old_pid)
+                    if healthy:
+                        break
             if healthy:
                 report["result"] = "already_healthy"
                 report["proof"] = detail
@@ -336,11 +348,12 @@ def run(config_path: Path) -> int:
                 continue
             pid = wait_port(int(config["port"]), True, int(candidate.get("timeout_seconds", 30)))
             candidate_count = candidate.get("expected_tool_count", config.get("expected_tool_count", 47))
+            candidate_config = {**config, "expected_version": candidate.get("expected_version", config["expected_version"])}
             if "expected_tool_count" in candidate:
-                healthy, detail = verify_service(config, pid, int(candidate_count))
+                healthy, detail = verify_service(candidate_config, pid, int(candidate_count))
             else:
                 # Keep legacy/test configs compatible while production candidates may pin distinct counts.
-                healthy, detail = verify_service(config, pid)
+                healthy, detail = verify_service(candidate_config, pid)
             attempt.update({"pid": max(pid, 0), "expected_tool_count": int(candidate_count), "verification": detail, "ok": healthy})
             report["attempts"].append(attempt)
             if healthy:

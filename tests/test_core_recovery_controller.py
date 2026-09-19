@@ -112,6 +112,38 @@ def test_recover_healthy_is_noop(monkeypatch, tmp_path):
     assert report["exit_code"] == controller.EXIT_ALREADY_HEALTHY
 
 
+def test_old_fallback_keeps_its_own_version_contract(monkeypatch, tmp_path):
+    path, config = make_config(tmp_path)
+    config['expected_version'] = '0.2.1'
+    config['candidates'][-1]['expected_version'] = '0.2.0'
+    path.write_text(json.dumps(config), encoding='utf-8')
+    monkeypatch.setattr(controller, 'port_pid', lambda port: 0)
+    monkeypatch.setattr(controller, 'wait_port', lambda *args: 1234)
+    monkeypatch.setattr(controller, 'task_command', lambda *args:
+        type('Result', (), {'returncode': 0, 'stdout': '', 'stderr': ''})())
+    versions = []
+    def verify(candidate, pid):
+        versions.append(candidate['expected_version'])
+        return len(versions) == 3, 'fixture'
+    monkeypatch.setattr(controller, 'verify_service', verify)
+    assert controller.run(path) == controller.EXIT_OK
+    assert versions == ['0.2.1', '0.2.1', '0.2.0']
+
+
+def test_healthy_old_fallback_is_not_restarted(monkeypatch, tmp_path):
+    path, config = make_config(tmp_path)
+    config['expected_version'] = '0.2.1'
+    config['candidates'][-1]['expected_version'] = '0.2.0'
+    path.write_text(json.dumps(config), encoding='utf-8')
+    monkeypatch.setattr(controller, 'port_pid', lambda port: 222)
+    monkeypatch.setattr(controller, 'verify_service', lambda c, p:
+        (c['expected_version'] == '0.2.0', 'fixture'))
+    touched = []
+    monkeypatch.setattr(controller, 'task_command', lambda *args: touched.append(args))
+    assert controller.run(path) == controller.EXIT_ALREADY_HEALTHY
+    assert not touched
+
+
 def test_expired_restart_request_is_rejected(monkeypatch, tmp_path):
     path, config = make_config(tmp_path)
     Path(config["request"]).mkdir()

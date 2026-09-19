@@ -76,6 +76,9 @@ class Bridge:
             cfg.home / "state/sessions.json", cfg.session_cache_bytes, cfg.max_sessions
         )
         self.gui = None
+        self.gui_lock = threading.RLock()
+        self.gui_timer = None
+        self.gui_idle_seconds = 120
         self.browser = None
         self.tasks = RecoverableTaskStore(cfg.home / "state/recoverable-tasks.sqlite3")
         self.dynamic_mcp = DynamicMCPManager(cfg)
@@ -428,6 +431,75 @@ class Bridge:
             raise BridgeError(s.error["code"], s.error["message"])
         return s.metadata()
 
+    def _command_auto(self, a):
+        """Dispatch once, then yield a resumable receipt rather than hiding output."""
+        started = self._session_start({"timeout_ms": 30000, **a})
+        session = self.sessions.get(started["session_id"])
+        session.finished.wait(a.get("yield_time_ms", 1000) / 1000)
+        result = session.read(max_bytes=a.get("output_limit_bytes", self.cfg.output_limit_bytes))
+        result.pop("chunks", None)  # stdout/stderr already contain this page.
+        if result.get("error"):
+            raise BridgeError(result["error"]["code"], result["error"]["message"],
+                              details={"session_id": session.id})
+        running = result["state"] in ("starting", "running")
+        result.update(
+            execution_backend="codex_app_server.command_exec",
+            effective_sandbox="dangerFullAccess",
+            completed=not running,
+            output_limit_bytes=a.get("output_limit_bytes", self.cfg.output_limit_bytes),
+            output_truncation="observed" if result["output_truncated"] else "not_observed",
+            status_message="命令仍在运行，请继续读取此会话并报告进度。" if running else "命令已结束，请检查退出码。",
+            next_action={"tool": "session_read", "arguments": {
+                "session_id": session.id, "cursor": result["next_cursor"]
+            }} if running or result["has_more"] else None,
+        )
+        return result
+
+    def _close_computer(self):
+        with self.gui_lock:
+            if self.gui_timer:
+                self.gui_timer.cancel()
+                self.gui_timer = None
+            if self.gui is None:
+                return {"closed": True, "already_closed": True}
+            self.gui.close()
+            self.gui = None
+            self.audit.emit("computer_released")
+            return {"closed": True, "snapshots_invalidated": True,
+                    "user_applications_closed": False}
+
+    def _idle_close_computer(self, gui):
+        with self.gui_lock:
+            if self.gui is not gui or self.gui_timer is not threading.current_thread():
+                return
+            try:
+                self._close_computer()
+            except Exception as exc:
+                self.audit.emit("computer_release_failed", error_type=type(exc).__name__)
+
+    def _computer_action(self, tool, a):
+        with self.gui_lock:
+            if tool == "computer_close":
+                return self._close_computer()
+            if self.gui_timer:
+                self.gui_timer.cancel()
+                self.gui_timer = None
+            started = time.perf_counter()
+            try:
+                self.ensure_ready()
+                if self.gui is not None and (self.gui.closed or not self.gui.thread.is_alive()):
+                    self._close_computer()
+                if self.gui is None:
+                    from .computer import OfficialComputer
+                    self.gui = OfficialComputer(self.cfg)
+                return self.gui.call(tool, a, ELICITATION_FORWARDER.get())
+            finally:
+                BACKEND_TIME.set(BACKEND_TIME.get() + time.perf_counter() - started)
+                if self.gui is not None:
+                    self.gui_timer = threading.Timer(self.gui_idle_seconds, self._idle_close_computer, (self.gui,))
+                    self.gui_timer.daemon = True
+                    self.gui_timer.start()
+
     def _do(self, tool, a):
         if tool.startswith("browser_"):
             if not self.cfg.browser_use_enabled:
@@ -455,16 +527,7 @@ class Bridge:
                     "capability_unavailable",
                     "Official Computer Use is not enabled for this bridge configuration.",
                 )
-            self.ensure_ready()
-            if self.gui is None:
-                from .computer import OfficialComputer
-
-                self.gui = OfficialComputer(self.cfg)
-            started = time.perf_counter()
-            try:
-                return self.gui.call(tool, a, ELICITATION_FORWARDER.get())
-            finally:
-                BACKEND_TIME.set(BACKEND_TIME.get() + time.perf_counter() - started)
+            return self._computer_action(tool, a)
         if tool == "task_manage":
             return self.tasks.manage(a)
         if tool == "mcp_manage":
@@ -492,6 +555,8 @@ class Bridge:
         if tool == "exec_command":
             if a.get("execution_mode") == "session":
                 return self._session_start(a)
+            if a.get("execution_mode", "auto") == "auto":
+                return self._command_auto(a)
             return self._command(
                 self._argv(a),
                 a.get("cwd"),
@@ -1136,15 +1201,17 @@ class Bridge:
         if self.closed:
             return
         self.closed = True
+        errors = []
         try:
-            if self.browser:
-                self.browser.close()
-            if self.gui:
-                self.gui.close()
-            if self.rpc:
-                self.rpc.close()
-            self.sessions.save()
-            self.tasks.close()
-            self.idempotency.close()
+            cleanups = ([self.browser.close] if self.browser else []) + [self._close_computer]
+            cleanups += ([self.rpc.close] if self.rpc else [])
+            cleanups += [self.sessions.save, self.tasks.close, self.idempotency.close]
+            for cleanup in cleanups:
+                try:
+                    cleanup()
+                except Exception as exc:
+                    errors.append(exc)
         finally:
             self.instance.close()
+        if errors:
+            raise errors[0]
