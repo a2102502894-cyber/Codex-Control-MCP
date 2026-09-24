@@ -140,14 +140,15 @@ def make_server(bridge):
             # does not issue sampling, elicitation, UI, or tool requests.
             params = getattr(context.session, "client_params", None)
             if params is None:
-                # Stateless HTTP intentionally does not retain initialize params
-                # on ServerSession. OwnerHTTP passively records the sanitized,
-                # authenticated initialize frame so we can still report the
-                # actual upstream client's negotiated declarations.
-                from .http_guard import latest_mcp_initialize
-
-                upstream = latest_mcp_initialize() or {"observed": False}
-                caps = upstream.get("capabilities") or {}
+                # A stateless request has no negotiated client binding. The last
+                # initialize observed by this process may belong to someone else,
+                # even when the two requests share an authenticated principal.
+                upstream = {
+                    "observed": False,
+                    "source": "stateless_http_no_client_binding",
+                    "reason": "No initialize parameters are bound to this request.",
+                }
+                caps = {}
             else:
                 dumped = params.model_dump(mode="json", by_alias=True)
                 caps = dumped.get("capabilities") or {}

@@ -79,7 +79,7 @@ class AppServer:
         except Exception:
             self.close()
             raise
-        audit.emit(
+        self._observe_after_dispatch(
             "appserver_start",
             pid=self.proc.pid,
             generation=self.generation,
@@ -91,6 +91,19 @@ class AppServer:
     @property
     def alive(self):
         return not self.closed and not self.broken and self.proc.poll() is None
+
+    def _observe_after_dispatch(self, event, *, _trace=None, **fields):
+        """A secondary audit error cannot discard an already-sent request/result.
+
+        Request intent is recorded synchronously before dispatch in begin().
+        Audit failures remain visible in Audit.observation and the call trace.
+        """
+        trace = _trace if _trace is not None else CURRENT_TRACE.get()
+        try:
+            self.audit.emit(event, **fields)
+        except Exception:
+            if trace is not None:
+                trace.audit_failed()
 
     def _write(self, msg):
         raw = (
@@ -129,16 +142,29 @@ class AppServer:
             future.ccm_trace = CURRENT_TRACE.get()
             self.pending[seq] = (method, future)
             try:
+                try:
+                    self.audit.emit(
+                        "rpc_dispatch_intent", method=method, request_id=seq,
+                        param_keys=sorted(params) if isinstance(params, dict) else [],
+                        generation=self.generation,
+                    )
+                except Exception as exc:
+                    raise BridgeError(
+                        "audit_unavailable",
+                        "Pre-dispatch audit failed; no RPC was sent.",
+                        details={"origin": "bridge_runtime", "method": method,
+                                 "request_id": seq, "operation_id": future.ccm_operation_id},
+                    ) from exc
                 self._write({"id": seq, "method": method, "params": params})
-                self.audit.emit(
-                    "rpc_send",
+                if future.ccm_trace is not None:
+                    future.ccm_trace.rpc_event("rpc_send", method, seq, self.generation)
+                self._observe_after_dispatch(
+                    "rpc_send", _trace=future.ccm_trace,
                     method=method,
                     request_id=seq,
                     param_keys=sorted(params) if isinstance(params, dict) else [],
                     generation=self.generation,
                 )
-                if future.ccm_trace is not None:
-                    future.ccm_trace.rpc_event("rpc_send", method, seq, self.generation)
             except Exception:
                 self.pending.pop(seq, None)
                 raise
@@ -212,8 +238,8 @@ class AppServer:
                         continue
                     if "error" in msg:
                         e = msg["error"]
-                        self.audit.emit(
-                            "rpc_error",
+                        self._observe_after_dispatch(
+                            "rpc_error", _trace=trace,
                             method=method,
                             code=e.get("code"),
                             operation_id=operation_id, request_id=msg["id"],
@@ -236,7 +262,7 @@ class AppServer:
                             )
                         )
                     else:
-                        self.audit.emit("rpc_result", method=method, request_id=msg["id"],
+                        self._observe_after_dispatch("rpc_result", _trace=trace, method=method, request_id=msg["id"],
                                         operation_id=operation_id, generation=self.generation)
                         if trace is not None:
                             trace.rpc_event("rpc_result", method, msg["id"], self.generation)
@@ -255,7 +281,7 @@ class AppServer:
                             f.set_result(msg.get("result"))
                 elif "method" in msg:
                     if "id" in msg:
-                        self.audit.emit(
+                        self._observe_after_dispatch(
                             "unexpected_callback",
                             method=msg["method"],
                             generation=self.generation,
@@ -273,7 +299,7 @@ class AppServer:
                         try:
                             self.callback(msg)
                         except Exception:
-                            self.audit.emit(
+                            self._observe_after_dispatch(
                                 "notification_handler_error", method=msg.get("method")
                             )
         except (OSError, ValueError, TypeError, AttributeError, RecursionError):
@@ -295,7 +321,7 @@ class AppServer:
                                      "runtime_generation": self.generation},
                         )
                     )
-            self.audit.emit("appserver_disconnect", generation=self.generation)
+            self._observe_after_dispatch("appserver_disconnect", generation=self.generation)
 
     def _drain_stderr(self):
         try:
@@ -338,7 +364,7 @@ class AppServer:
                     stream.close()
                 except Exception:
                     pass
-            self.audit.emit(
+            self._observe_after_dispatch(
                 "appserver_stop", pid=self.proc.pid, generation=self.generation,
                 pipe_readers_stopped=not self.read_thread.is_alive() and not self.error_thread.is_alive(),
             )

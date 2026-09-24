@@ -7,60 +7,10 @@ import collections
 import hmac
 import json
 import re
-import threading
 import time
 from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
 from mcp.server.auth.provider import AccessToken
 from .http_validation import bearer_credential
-
-
-_LATEST_MCP_INITIALIZE = None
-_LATEST_MCP_INITIALIZE_LOCK = threading.Lock()
-
-
-def _record_mcp_initialize(body, auth_info):
-    """Capture a sanitized initialize snapshot without changing transport semantics."""
-    try:
-        payload = json.loads(body)
-    except (TypeError, ValueError, UnicodeDecodeError):
-        return
-    if not isinstance(payload, dict) or payload.get("method") != "initialize":
-        return
-    params = payload.get("params")
-    if not isinstance(params, dict):
-        return
-    caps = params.get("capabilities")
-    if not isinstance(caps, dict):
-        return
-    info = params.get("clientInfo")
-    if not isinstance(info, dict):
-        info = {}
-    sanitized_caps = {
-        key: caps[key]
-        for key in ("sampling", "elicitation", "roots", "tasks")
-        if key in caps
-    }
-    observation = {
-        "observed": True,
-        "source": "authenticated_http_initialize",
-        "observed_at_unix": time.time(),
-        "protocol_version": params.get("protocolVersion"),
-        "client_info": {
-            key: info.get(key) for key in ("name", "version", "title") if info.get(key) is not None
-        },
-        "auth_client_id": getattr(auth_info, "client_id", None),
-        "capabilities": sanitized_caps,
-    }
-    with _LATEST_MCP_INITIALIZE_LOCK:
-        global _LATEST_MCP_INITIALIZE
-        _LATEST_MCP_INITIALIZE = observation
-
-
-def latest_mcp_initialize():
-    with _LATEST_MCP_INITIALIZE_LOCK:
-        if _LATEST_MCP_INITIALIZE is None:
-            return None
-        return json.loads(json.dumps(_LATEST_MCP_INITIALIZE))
 
 
 class OwnerHTTP:
@@ -235,8 +185,6 @@ class OwnerHTTP:
         if b"content-length" in headers and total != length:
             return await self.error(send, 400, "Content-Length mismatch")
         body = bytes(body)
-        if not public and scope.get("method") == "POST":
-            _record_mcp_initialize(body, auth_info)
         delivered = False
 
         async def bounded_receive():

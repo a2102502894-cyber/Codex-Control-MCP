@@ -22,11 +22,16 @@ class CallTrace:
         self.rpc_dispatched_count = 0
         self.rpc_response_count = 0
         self.rpc_records = []
+        self.rpc_audit_error_count = 0
         self.lock = threading.RLock()
 
     def mark(self, stage):
         with self.lock:
             self.stage = stage
+
+    def audit_failed(self):
+        with self.lock:
+            self.rpc_audit_error_count += 1
 
     def rpc_event(self, event, method, request_id, generation, *, code=None):
         # Store only protocol metadata, never command text, arguments or output.
@@ -68,6 +73,8 @@ class CallTrace:
                 'last_verified_stage': self.stage,
                 'rpc_dispatched_count': self.rpc_dispatched_count,
                 'rpc_response_count': self.rpc_response_count,
+                'rpc_audit_error_count': self.rpc_audit_error_count,
+                'rpc_audit_status': 'degraded' if self.rpc_audit_error_count else 'recorded',
                 'rpc_records': [dict(row) for row in self.rpc_records],
                 'rpc_records_truncated': self.rpc_dispatched_count + self.rpc_response_count > 32,
                 'failure_origin': failure_origin,
