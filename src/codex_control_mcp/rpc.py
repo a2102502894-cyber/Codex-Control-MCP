@@ -1,7 +1,8 @@
 from __future__ import annotations
 import concurrent.futures, json, os, subprocess, threading, uuid
 from . import __version__
-from .common import CREATE_NO_WINDOW, digest, is_admin
+from .common import CREATE_NO_WINDOW, CURRENT_OPERATION, digest, is_admin
+from .diagnostics import CURRENT_TRACE
 from .errors import BridgeError
 
 
@@ -123,6 +124,9 @@ class AppServer:
             self.next_id += 1
             seq = self.next_id
             future = concurrent.futures.Future()
+            future.ccm_operation_id = CURRENT_OPERATION.get()
+            future.ccm_request_id = seq
+            future.ccm_trace = CURRENT_TRACE.get()
             self.pending[seq] = (method, future)
             try:
                 self._write({"id": seq, "method": method, "params": params})
@@ -133,6 +137,8 @@ class AppServer:
                     param_keys=sorted(params) if isinstance(params, dict) else [],
                     generation=self.generation,
                 )
+                if future.ccm_trace is not None:
+                    future.ccm_trace.rpc_event("rpc_send", method, seq, self.generation)
             except Exception:
                 self.pending.pop(seq, None)
                 raise
@@ -200,6 +206,8 @@ class AppServer:
                     if not item:
                         continue
                     method, f = item
+                    operation_id = getattr(f, "ccm_operation_id", None)
+                    trace = getattr(f, "ccm_trace", None)
                     if f.done():
                         continue
                     if "error" in msg:
@@ -208,8 +216,11 @@ class AppServer:
                             "rpc_error",
                             method=method,
                             code=e.get("code"),
+                            operation_id=operation_id, request_id=msg["id"],
                             generation=self.generation,
                         )
+                        if trace is not None:
+                            trace.rpc_event("rpc_error", method, msg["id"], self.generation, code=e.get("code"))
                         f.set_exception(
                             BridgeError(
                                 "backend_error",
@@ -217,10 +228,18 @@ class AppServer:
                                 details={
                                     "rpc_code": e.get("code"),
                                     "message_hash": digest(e.get("message", "")),
+                                    "origin": "codex_app_server",
+                                    "operation_id": operation_id,
+                                    "request_id": msg["id"],
+                                    "runtime_generation": self.generation,
                                 },
                             )
                         )
                     else:
+                        self.audit.emit("rpc_result", method=method, request_id=msg["id"],
+                                        operation_id=operation_id, generation=self.generation)
+                        if trace is not None:
+                            trace.rpc_event("rpc_result", method, msg["id"], self.generation)
                         try:
                             self.schema.validate_response(method, msg.get("result"))
                         except Exception as e:
@@ -270,7 +289,10 @@ class AppServer:
                         BridgeError(
                             "execution_state_unknown",
                             reason,
-                            details={"method": method},
+                            details={"method": method, "origin": "execution_transport",
+                                     "operation_id": getattr(f, "ccm_operation_id", None),
+                                     "request_id": getattr(f, "ccm_request_id", None),
+                                     "runtime_generation": self.generation},
                         )
                     )
             self.audit.emit("appserver_disconnect", generation=self.generation)

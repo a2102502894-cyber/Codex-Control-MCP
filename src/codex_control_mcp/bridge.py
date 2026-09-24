@@ -17,6 +17,8 @@ from .common import (
 from .config import build_environment
 from .discovery import Discovery
 from .errors import BridgeError
+from .diagnostics import (CallTrace, CURRENT_TRACE, INCOMING_OPERATION,
+                          current_rpc_evidence, error_origin, health_observation)
 from .idempotency import Idempotency
 from .task_runtime import RecoverableTaskStore
 from .dynamic_mcp import DynamicMCPManager
@@ -183,10 +185,13 @@ class Bridge:
                 raise BridgeError(
                     "execution_state_unknown",
                     "Timed out waiting for the official response; no replay is allowed.",
-                    details={"method": method},
+                    details={"method": method, "origin": "execution_transport",
+                             "operation_id": CURRENT_OPERATION.get(),
+                             "runtime_generation": getattr(rpc, "generation", None)},
                 ) from exc
             if self.rpc is rpc:
-                self.verified[method] = {"at": utc_now(), "result": "PASS"}
+                self.verified[method] = {"at": utc_now(), "result": "PASS",
+                                         "generation": rpc.generation}
             return result
         finally:
             BACKEND_TIME.set(BACKEND_TIME.get() + time.perf_counter() - start)
@@ -415,6 +420,9 @@ class Bridge:
         try:
             def completed(f):
                 s.finish(f)
+                if not s.error and self.rpc and self.rpc.generation == s.generation:
+                    self.verified["command/exec"] = {"at": utc_now(), "result": "PASS",
+                                                     "generation": s.generation}
                 self.sessions.save()
 
             s.future.add_done_callback(completed)
@@ -428,7 +436,9 @@ class Bridge:
         except concurrent.futures.TimeoutError:
             pass
         if s.error:
-            raise BridgeError(s.error["code"], s.error["message"])
+            raise BridgeError(s.error["code"], s.error["message"],
+                              retryable=s.error.get("retryable", False),
+                              details=s.error.get("details", {}))
         return s.metadata()
 
     def _command_auto(self, a):
@@ -440,7 +450,9 @@ class Bridge:
         result.pop("chunks", None)  # stdout/stderr already contain this page.
         if result.get("error"):
             raise BridgeError(result["error"]["code"], result["error"]["message"],
-                              details={"session_id": session.id})
+                              retryable=result["error"].get("retryable", False),
+                              details={**result["error"].get("details", {}),
+                                       "session_id": session.id})
         running = result["state"] in ("starting", "running")
         result.update(
             execution_backend="codex_app_server.command_exec",
@@ -1012,9 +1024,9 @@ class Bridge:
                 )
             )
         else:
-            if "command/exec" in self.verified:
+            if current_rpc_evidence(self, ("command/exec",)):
                 checks["shell"] = "PASS"
-            if "fs/readDirectory" in self.verified or "fs/readFile" in self.verified:
+            if current_rpc_evidence(self, ("fs/readDirectory", "fs/readFile")):
                 checks["files"] = "PASS"
         inference = sum(
             v for k, v in self.audit.methods.items() if k not in ALLOWED_METHODS
@@ -1036,6 +1048,7 @@ class Bridge:
         return {
             "overall": overall,
             "checks": checks,
+            "health_observation": health_observation(self, checks, active),
             "runtime": runtime_view,
             "appserver_pid": self.rpc.proc.pid,
             "bridge_version": __version__,
@@ -1059,114 +1072,101 @@ class Bridge:
     def execute(self, tool, args=None):
         start = time.perf_counter()
         token = BACKEND_TIME.set(0.0)
-        operation_id = uuid.uuid4().hex
+        incoming = INCOMING_OPERATION.get()
+        incoming_token = INCOMING_OPERATION.set(None)
+        parent_operation_id = CURRENT_OPERATION.get()
+        operation_id = incoming or uuid.uuid4().hex
         operation_token = CURRENT_OPERATION.set(operation_id)
+        trace = CallTrace(operation_id, mcp_received=bool(incoming),
+                          parent_operation_id=parent_operation_id)
+        trace_token = CURRENT_TRACE.set(trace)
         input_is_object = args is None or isinstance(args, dict)
         a = dict(args or {}) if input_is_object else {}
         key = a.pop("idempotency_key", None)
         risk = (
-            "read"
-            if tool in READ_TOOLS
+            "read" if tool in READ_TOOLS
             or (tool == "git_branch" and a.get("action", "list") == "list")
-            else (
-                "dangerous"
-                if tool
-                in ("exec_command", "session_start", "file_delete", "session_kill", "host_exec", "mcp_tool_call")
-                else "write"
-            )
+            else "dangerous" if tool in (
+                "exec_command", "session_start", "file_delete", "session_kill",
+                "host_exec", "mcp_tool_call") else "write"
         )
         reserved = False
+        failure_origin = None
+        replayed_operation_id = None
         try:
+            # Record arrival before validation, including rejected local inputs.
+            self.audit.emit("tool_received", tool=tool, risk_level=risk)
+            trace.mark("argument_validation")
             if not input_is_object:
-                raise BridgeError(
-                    "invalid_arguments", "Tool arguments must be an object."
-                )
+                raise BridgeError("invalid_arguments", "Tool arguments must be an object.")
             validate_tool(tool, dict(args or {}))
+            trace.mark("arguments_validated")
+            cached = None
             if key and risk != "read":
                 cached = self.idempotency.reserve(key, tool, a)
-                if cached is not None:
-                    return {**cached, "idempotent_replay": True}
-                reserved = True
-            self.audit.emit(
-                "tool_start", tool=tool, risk_level=risk, param_keys=sorted(a)
-            )
-            if tool in FILE_WRITES:
-                with self.write_lock:
-                    data = self._do(tool, a)
+                reserved = cached is None
+            if cached is not None:
+                out = {**cached, "idempotent_replay": True}
+                replayed_operation_id = cached.get("operation_id")
+                failure_origin = (cached.get("diagnostics") or {}).get("failure_origin")
+                trace.mark("cached_receipt_returned")
             else:
-                data = self._do(tool, a)
-            ok = not (
-                tool
-                in (
-                    "exec_command",
-                    "file_patch",
-                    "git_commit",
-                    "git_branch",
-                    "git_status",
-                    "git_diff",
-                    "git_log",
-                    "search_files",
-                    "search_text",
-                )
-                and isinstance(data, dict)
-                and data.get("exit_code") not in (None, 0)
-            )
-            out = {
-                "ok": ok,
-                "tool": tool,
-                "risk_level": risk,
-                "result": data,
-                "error": None
-                if ok
-                else {
-                    "code": "command_failed",
-                    "message": "Command returned a nonzero exit code.",
-                    "retryable": False,
-                },
-            }
+                self.audit.emit("tool_start", tool=tool, risk_level=risk, param_keys=sorted(a))
+                trace.mark("bridge_dispatch")
+                if tool in FILE_WRITES:
+                    with self.write_lock:
+                        data = self._do(tool, a)
+                else:
+                    data = self._do(tool, a)
+                process_tools = {
+                    "exec_command", "session_read", "file_patch", "git_commit",
+                    "git_branch", "git_status", "git_diff", "git_log",
+                    "search_files", "search_text",
+                }
+                error = None
+                if tool in process_tools and isinstance(data, dict):
+                    if isinstance(data.get("error"), dict) and data["error"]:
+                        error = dict(data["error"])
+                    elif data.get("exit_code") not in (None, 0):
+                        error = {"code": "command_failed",
+                                 "message": "Command returned a nonzero exit code.",
+                                 "retryable": False,
+                                 "details": {"origin": "command_process",
+                                             "exit_code": data["exit_code"]}}
+                out = {"ok": error is None, "tool": tool, "risk_level": risk,
+                       "result": data, "error": error}
+                if error:
+                    failure_origin = error_origin(error)
         except BridgeError as e:
-            out = {
-                "ok": False,
-                "tool": tool,
-                "risk_level": risk,
-                "result": None,
-                "error": e.as_dict(),
-            }
+            out = {"ok": False, "tool": tool, "risk_level": risk,
+                   "result": None, "error": e.as_dict()}
+            failure_origin = error_origin(out["error"], stage=trace.stage)
         except (KeyError, ValueError, TypeError, UnicodeError) as e:
-            out = {
-                "ok": False,
-                "tool": tool,
-                "risk_level": risk,
-                "result": None,
-                "error": {
-                    "code": "invalid_arguments",
-                    "message": f"Input rejected ({type(e).__name__}).",
-                    "retryable": False,
-                },
-            }
+            out = {"ok": False, "tool": tool, "risk_level": risk, "result": None,
+                   "error": {"code": "invalid_arguments",
+                             "message": f"Input rejected ({type(e).__name__}).",
+                             "retryable": False}}
+            failure_origin = error_origin(out["error"], stage=trace.stage)
         except Exception as e:
-            out = {
-                "ok": False,
-                "tool": tool,
-                "risk_level": risk,
-                "result": None,
-                "error": {
-                    "code": "internal_error",
-                    "message": f"Operation failed ({type(e).__name__}); no fallback executor used.",
-                    "retryable": False,
-                },
-            }
+            out = {"ok": False, "tool": tool, "risk_level": risk, "result": None,
+                   "error": {"code": "internal_error",
+                             "message": f"Operation failed ({type(e).__name__}); no fallback executor used.",
+                             "retryable": False}}
+            failure_origin = "bridge_or_adapter_unclassified"
         finally:
             backend = BACKEND_TIME.get()
             BACKEND_TIME.reset(token)
             CURRENT_OPERATION.reset(operation_token)
+            CURRENT_TRACE.reset(trace_token)
+            INCOMING_OPERATION.reset(incoming_token)
+        out["operation_id"] = operation_id
+        out["diagnostics"] = trace.receipt(
+            out, failure_origin=failure_origin, replayed_operation_id=replayed_operation_id)
         out["timing"] = {
             "total_ms": round((time.perf_counter() - start) * 1000, 3),
             "official_rpc_wait_ms": 0 if tool.startswith('browser_') and self.cfg.browser.get('backend') == 'tabbit' else round(backend * 1000, 3),
             "execution_backend_wait_ms": round(backend * 1000, 3),
-            "bridge_overhead_ms": round(
-                max(0, time.perf_counter() - start - backend) * 1000, 3
-            ),
+            "bridge_overhead_ms": round(max(0, time.perf_counter() - start - backend) * 1000, 3),
         }
         out["evidence"] = {
             "runtime_version": self.runtime.cli_version if self.runtime else None,
@@ -1177,21 +1177,17 @@ class Bridge:
         }
         if isinstance(out.get("result"), dict) and "_images" in out["result"]:
             out["_image_blocks"] = out["result"].pop("_images")
+        data = out.get("result")
+        data = data if isinstance(data, dict) else {}
         self.audit.emit(
-            "tool_finish",
-            tool=tool,
-            operation_id=operation_id,
+            "tool_finish", tool=tool, operation_id=operation_id,
             version=self.runtime.cli_version if self.runtime else None,
-            proxy_source=self.proxy.get("source"),
-            exit_code=(out.get("result") or {}).get("exit_code")
-            if isinstance(out.get("result"), dict)
-            else None,
-            ok=out["ok"],
-            risk_level=risk,
-            duration_ms=out["timing"]["total_ms"],
+            proxy_source=self.proxy.get("source"), exit_code=data.get("exit_code"),
+            ok=out["ok"], risk_level=risk, duration_ms=out["timing"]["total_ms"],
             error_code=(out.get("error") or {}).get("code"),
-            application_authorization=(out.get("result") or {}).get("application_authorization")
-            if isinstance(out.get("result"), dict) else None,
+            failure_origin=failure_origin, last_verified_stage=trace.stage,
+            idempotent_replay=bool(out.get("idempotent_replay")),
+            application_authorization=data.get("application_authorization"),
         )
         if reserved:
             self.idempotency.finish(key, out)

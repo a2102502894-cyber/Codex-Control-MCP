@@ -42,7 +42,12 @@ def roundtrip(req, preapproved, callback=None):
                     result = await client.call_tool("computer_snapshot", {})
                 group.cancel_scope.cancel()
                 return result
-    return asyncio.run(run()), events
+    result = asyncio.run(run())
+    ingress = [fields for event, fields in events if event == "mcp_received"]
+    assert len(ingress) == 1 and ingress[0]["tool"] == "computer_snapshot"
+    assert len(ingress[0]["operation_id"]) == 32
+    # Keep permission-decision assertions independent of transport audit events.
+    return result, [(event, fields) for event, fields in events if event != "mcp_received"]
 
 
 @pytest.mark.parametrize("app", ["tabbit.exe", "NewlyInstalledFixture.exe", "Example.Package!App"])

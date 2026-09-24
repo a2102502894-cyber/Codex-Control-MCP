@@ -50,8 +50,14 @@ def test_refresh_defers_active_session_and_disconnect_is_lost(bridge):
     assert not r["ok"] and r["error"]["code"] == "update_pending"
     assert b.rpc.proc.pid == pid
     b.rpc.close()
-    r = ok(b, "session_read", {"session_id": s["session_id"]})
+    receipt = b.execute("session_read", {"session_id": s["session_id"]})
+    r = receipt["result"]
     assert r["state"] in ("lost", "exited")
+    if r["state"] == "lost":
+        assert not receipt["ok"] and receipt["error"]["code"] == "execution_state_unknown"
+        assert receipt["diagnostics"]["failure_origin"] == "execution_transport"
+    else:
+        assert receipt["ok"] == (r["exit_code"] == 0)
     assert b.rpc.generation == generation  # Cached read must not spawn a new runtime.
     ok(b, "exec_command", {"command": "Write-Output 'NEW_CONNECTION_OK'"})
     assert b.rpc.generation != generation  # A new execution may reconnect.

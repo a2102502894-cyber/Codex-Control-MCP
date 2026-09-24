@@ -1,6 +1,6 @@
 from __future__ import annotations
 import base64, codecs, collections, copy, dataclasses, json, threading, uuid
-from .common import atomic_json, utc_now
+from .common import CURRENT_OPERATION, atomic_json, utc_now
 from .errors import BridgeError
 
 
@@ -25,6 +25,7 @@ class Session:
     lock: threading.RLock = dataclasses.field(default_factory=threading.RLock)
     decoders: dict = dataclasses.field(default_factory=dict)
     finished: threading.Event = dataclasses.field(default_factory=threading.Event)
+    origin_operation_id: str | None = dataclasses.field(default_factory=CURRENT_OPERATION.get)
 
     def append(self, params):
         raw = base64.b64decode(params.get("deltaBase64", ""), validate=True)
@@ -117,6 +118,7 @@ class Session:
         with self.lock:
             return {
                 "session_id": self.id,
+                "origin_operation_id": self.origin_operation_id,
                 "owner": "trusted_local_owner",
                 "backend": "codex_app_server.command_exec",
                 "runtime_generation": self.generation,

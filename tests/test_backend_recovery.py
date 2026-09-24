@@ -97,7 +97,9 @@ def test_long_session_cursor_and_errors_are_detached(tmp_path):
         s.next_cursor=2_000_000
         s.error={'code':'fixture','details':{'value':'original'}}
         result=bridge.execute('session_read',{'session_id':s.id,'cursor':2_000_000})
-        assert result['ok'] and result['result']['next_cursor']==2_000_000
+        # The read retains its cursor/data, but the failed task is not success.
+        assert not result['ok'] and result['error']['code']=='fixture'
+        assert result['result']['next_cursor']==2_000_000
         result['result']['error']['details']['value']='changed'
         assert s.error['details']['value']=='original'
         bridge.sessions.save()

@@ -11,6 +11,7 @@ from . import __version__
 from .auth import owner_token
 from .bridge import Bridge
 from .common import ELICITATION_FORWARDER, atomic_json, utc_now
+from .diagnostics import INCOMING_OPERATION
 from .tools import TOOL_SPECS
 
 PROGRESS_INTERVAL_SECONDS = 5
@@ -40,9 +41,15 @@ async def execute_with_progress(bridge, context, name, arguments):
             await notify(elapsed, f"工具仍在执行，已等待约 {elapsed:g} 秒。")
 
     task = asyncio.create_task(heartbeat()) if progress_token is not None else None
+    operation_id = uuid.uuid4().hex
+    incoming_token = INCOMING_OPERATION.set(operation_id)
     try:
+        audit = getattr(bridge, "audit", None)
+        if audit is not None:
+            audit.emit("mcp_received", tool=name, operation_id=operation_id)
         return await anyio.to_thread.run_sync(bridge.execute, name, arguments)
     finally:
+        INCOMING_OPERATION.reset(incoming_token)
         if task:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
