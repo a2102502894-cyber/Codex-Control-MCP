@@ -76,6 +76,7 @@ class OwnerHTTP:
         body_timeout=15,
     ):
         self.manager, self.token, self.limit, self.rpm = manager, token, limit, rpm
+        self.audit = getattr(getattr(manager, "app", None), "_ccm_audit", None)
         self.oauth, self.hosts, self.body_timeout = (
             oauth,
             {host.lower() for host in (hosts or ())},
@@ -97,6 +98,8 @@ class OwnerHTTP:
         return True
 
     async def error(self, send, status, message):
+        from .http_observation import mark_http_gate_rejection
+        mark_http_gate_rejection(status)
         payload = json.dumps({"error": message}).encode()
         headers = [
             (b"content-type", b"application/json"),
@@ -118,6 +121,10 @@ class OwnerHTTP:
         await send({"type": "http.response.body", "body": payload})
 
     async def __call__(self, scope, receive, send):
+        from .http_observation import observe_http
+        return await observe_http(self.audit, self._dispatch, scope, receive, send)
+
+    async def _dispatch(self, scope, receive, send):
         if scope["type"] != "http":
             return
         path = scope.get("path")

@@ -89,7 +89,7 @@ async def main():
             state=json.loads((cfg.home/'state/service.json').read_text('utf-8'))
             report.update(executable=state['executable'],executable_sha256=hashlib.sha256(Path(state['executable']).read_bytes()).hexdigest())
         env,_=build_environment(cfg)
-        endpoint=(cfg.oauth['issuer'] if args.public else f'http://127.0.0.1:{cfg.http.get("port",8767)}').rstrip('/')+'/mcp'
+        endpoint=(cfg.oauth['issuer'] if args.public else f'http://127.0.0.1:{cfg.http.get("port",8774)}').rstrip('/')+'/mcp'
         report['endpoint']=endpoint
         transport=SafeConnectTransport(proxy=env.get('HTTPS_PROXY') if args.public else None,events=events)
         async with httpx.AsyncClient(transport=transport,trust_env=False,timeout=75,
@@ -99,7 +99,7 @@ async def main():
                     init=await client.initialize()
                     check('version',init.serverInfo.version==__version__)
                     tools=await client.list_tools()
-                    check('41_tools',len(tools.tools)==41,tool_count=len(tools.tools))
+                    check('48_tools',len(tools.tools)==48,tool_count=len(tools.tools))
                     async def call(name,values):
                         result=await client.call_tool(name,values)
                         if result.isError or not result.structuredContent['ok']:

@@ -124,10 +124,18 @@ def ok(b, tool, args=None):
     return out["result"]
 
 
-def wait_session(b, sid, needle=None, seconds=8):
+def wait_session(b, sid, needle=None, seconds=8, terminated=False):
     end = time.monotonic() + seconds
     while time.monotonic() < end:
-        d = ok(b, "session_read", {"session_id": sid})
+        receipt = b.execute("session_read", {"session_id": sid})
+        d = receipt["result"]
+        if not receipt["ok"]:
+            assert terminated and d is not None, receipt
+            assert d["state"] == "exited" and d["exit_code"] not in (None, 0), receipt
+            assert receipt["error"]["code"] == "command_failed", receipt
+            assert receipt["diagnostics"]["failure_origin"] == "command_process", receipt
+        elif d["state"] == "exited":
+            assert d["exit_code"] == 0, receipt
         if needle is not None and needle in d["stdout"]:
             return d
         if needle is None and d["state"] not in ("starting", "running"):
@@ -278,7 +286,7 @@ def test_terminate_and_session_ownership(live):
     sid = s["session_id"]
     wait_session(b, sid, "WAITING")
     ok(b, "session_kill", {"session_id": sid})
-    r = wait_session(b, sid)
+    r = wait_session(b, sid, terminated=True)
     assert r["state"] == "exited"
     assert not b.execute("session_kill", {"session_id": "not-owned"})["ok"]
 

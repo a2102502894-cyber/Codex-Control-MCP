@@ -72,6 +72,8 @@ def make_server(bridge):
         instructions="Use official Codex runtime operations. Before working, tell the user the next action. exec_command defaults to auto: running is NOT completion. Poll session_read using session_id and next_cursor until a final exit code; report meaningful progress and never resubmit the same command because output is absent. Use computer_close in finally after each desktop workflow; the bridge also releases idle control after 120 seconds. A new workflow needs a fresh snapshot. Commands run as the service account with dangerFullAccess. No model turns are started by this server.",
     )
 
+    server._ccm_audit = getattr(bridge, "audit", None)
+
     @server.list_tools()
     async def list_tools():
         return [
@@ -130,6 +132,8 @@ def make_server(bridge):
         finally:
             ELICITATION_FORWARDER.reset(token)
         out = dict(out)
+        from .http_observation import attach_transport_receipt
+        attach_transport_receipt(out, getattr(bridge, "audit", None))
         if name == "codex_capabilities" and out.get("ok"):
             # Report only negotiated MCP client metadata/capabilities from the
             # current upstream connection. This is deliberately passive: it

@@ -175,3 +175,10 @@ HTTPS 计划任务 `Codex-Control-MCP-HTTPS-OnDemand` 同样使用该 venv 运�
 
 `scripts/freeze_source_lkg.py` 可生成独立源码候选、隔离导入核对 0.2.0/47 工具/无静态 Grok 或 Director/默认 8774，并写 UTF-8 manifest 与逐文件 SHA256。默认只生成候选；只有验收范围明确且通过后才使用 `--activate`。快照不包含凭据；外部 MCP 的业务能力不属于本项目 LKG 认证范围，`packaging_required=false`。
 
+
+
+## 原生维护与分层故障回执
+
+日常维护优先使用 `scripts\Maintain-Core.cmd --check`；明确重启时使用 `--restart`。默认只检查，入口不修改 PowerShell 执行策略。详见 [原生维护与 HTTP 观测](docs/native-maintenance-and-http-observation.md)。
+
+工具回执包含 `operation_id`，HTTP 回执额外关联服务器生成的 `http_request_id`。成功读取输出不等于命令执行成功，进程非零退出保留失败结果。平台内部安全判定仍不在本机可观察范围内。
