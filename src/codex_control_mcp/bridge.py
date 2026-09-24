@@ -1049,6 +1049,7 @@ class Bridge:
             "overall": overall,
             "checks": checks,
             "health_observation": health_observation(self, checks, active),
+            "audit_observation": self.audit.observation() if hasattr(self.audit, "observation") else None,
             "runtime": runtime_view,
             "appserver_pid": self.rpc.proc.pid,
             "bridge_version": __version__,
@@ -1179,18 +1180,34 @@ class Bridge:
             out["_image_blocks"] = out["result"].pop("_images")
         data = out.get("result")
         data = data if isinstance(data, dict) else {}
-        self.audit.emit(
-            "tool_finish", tool=tool, operation_id=operation_id,
-            version=self.runtime.cli_version if self.runtime else None,
-            proxy_source=self.proxy.get("source"), exit_code=data.get("exit_code"),
-            ok=out["ok"], risk_level=risk, duration_ms=out["timing"]["total_ms"],
-            error_code=(out.get("error") or {}).get("code"),
-            failure_origin=failure_origin, last_verified_stage=trace.stage,
-            idempotent_replay=bool(out.get("idempotent_replay")),
-            application_authorization=data.get("application_authorization"),
-        )
+        try:
+            self.audit.emit(
+                "tool_finish", tool=tool, operation_id=operation_id,
+                version=self.runtime.cli_version if self.runtime else None,
+                proxy_source=self.proxy.get("source"), exit_code=data.get("exit_code"),
+                ok=out["ok"], risk_level=risk, duration_ms=out["timing"]["total_ms"],
+                error_code=(out.get("error") or {}).get("code"),
+                failure_origin=failure_origin, last_verified_stage=trace.stage,
+                idempotent_replay=bool(out.get("idempotent_replay")),
+                application_authorization=data.get("application_authorization"),
+            )
+        except Exception as exc:
+            # The action may already have completed. Preserve its actual result
+            # and still finalize its reservation; never silently dispatch again.
+            out["diagnostics"]["audit_recording"] = {
+                "status": "degraded", "event": "tool_finish",
+                "error_type": type(exc).__name__, "operation_result_preserved": True,
+            }
         if reserved:
-            self.idempotency.finish(key, out)
+            try:
+                self.idempotency.finish(key, out)
+            except Exception as exc:
+                # The durable started reservation remains. A repeated key is
+                # refused rather than re-executed when final persistence fails.
+                out["diagnostics"]["idempotency_persistence"] = {
+                    "status": "failed", "error_type": type(exc).__name__,
+                    "operation_result_preserved": True, "automatic_retry_performed": False,
+                }
         return out
 
     def close(self):

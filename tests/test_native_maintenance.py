@@ -53,7 +53,9 @@ def test_disabled_or_busy_task_never_queues(home, enabled, state, code):
 def test_failed_start_removes_only_its_unclaimed_request(home):
     queue = home / "state/core-controller-requests"
     queue.mkdir()
-    other = queue / "someone-else.json"
+    # Non-request data is preserved. Pending JSON requests are now tested
+    # separately and must prevent any additional restart submission.
+    other = queue / "someone-else.keep"
     other.write_text("{}")
     def fail(arg):
         raise OSError("fixture")

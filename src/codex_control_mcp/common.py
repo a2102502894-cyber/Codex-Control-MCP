@@ -100,6 +100,9 @@ class Audit:
         self.path, self.lock = path, threading.Lock()
         path.parent.mkdir(parents=True, exist_ok=True)
         self.methods = {}
+        self.write_failures = 0
+        self.last_failure = None
+        self.last_write_status = "not_observed"
 
     def emit(self, event, **fields):
         with self.lock:
@@ -112,12 +115,31 @@ class Audit:
             if event == "rpc_send":
                 name = fields.get("method", "?")
                 self.methods[name] = self.methods.get(name, 0) + 1
-            if self.path.exists() and self.path.stat().st_size > 4 * 1024 * 1024:
-                os.replace(self.path, self.path.with_suffix(".previous.jsonl"))
-            with self.path.open("a", encoding="utf-8") as f:
-                f.write(
-                    json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n"
-                )
+            try:
+                if self.path.exists() and self.path.stat().st_size > 4 * 1024 * 1024:
+                    os.replace(self.path, self.path.with_suffix(".previous.jsonl"))
+                with self.path.open("a", encoding="utf-8") as f:
+                    f.write(
+                        json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n"
+                    )
+            except Exception as exc:
+                self.write_failures += 1
+                self.last_failure = {"at": utc_now(), "error_type": type(exc).__name__}
+                self.last_write_status = "failed"
+                raise
+            else:
+                self.last_write_status = "recorded"
+
+    def observation(self):
+        """Payload-free lifetime counters; does not weaken mandatory logging."""
+        with self.lock:
+            return {
+                "scope": "current_bridge_process",
+                "last_write_status": self.last_write_status,
+                "write_failures": self.write_failures,
+                "last_failure": dict(self.last_failure) if self.last_failure else None,
+                "history_survives_process_restart": False,
+            }
 
 
 class InstanceLock:

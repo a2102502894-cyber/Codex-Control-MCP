@@ -14,6 +14,9 @@ import sys
 from typing import Any
 import uuid
 
+from .common import InstanceLock
+from .errors import BridgeError
+
 CONTROLLER_TASK = "Codex-Control-MCP-Core-Controller"
 
 
@@ -77,34 +80,53 @@ def submit_request(home: Path, task: Any, *, check_only: bool = False) -> dict:
     # request which a later watchdog could unexpectedly interpret as a restart.
     if int(task.State) in (2, 4):
         raise MaintenanceError("controller_busy", "维护控制器正在运行，未重复提交请求。")
-    queue = home / "state" / "core-controller-requests"
-    queue.mkdir(exist_ok=True)
-    request_id = uuid.uuid4().hex
-    target = queue / (request_id + ".json")
-    stage = queue / (request_id + ".tmp")
-    record = {"schema": 1, "operation": "restart", "request_id": request_id,
-              "requested_by_pid": os.getpid(), "created_at": datetime.now(timezone.utc).isoformat()}
+    # Serialize competing submitters across threads AND separate CLI processes.
+    guard = InstanceLock(home / "state" / "maintenance-submit.guard")
     try:
-        with stage.open("x", encoding="utf-8", newline="\n") as stream:
-            json.dump(record, stream, ensure_ascii=False)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(stage, target)
+        guard.acquire()
+    except BridgeError as exc:
+        raise MaintenanceError("controller_busy", "另一个维护请求正在提交，未重复执行。") from exc
+    try:
+        if int(task.State) in (2, 4):
+            raise MaintenanceError("controller_busy", "维护控制器正在运行，未重复提交请求。")
+        queue = home / "state" / "core-controller-requests"
+        queue.mkdir(exist_ok=True)
+        if next(queue.glob("*.json"), None) is not None:
+            raise MaintenanceError("pending_request_exists", "已有维护请求尚未处理，请先核对回执；未叠加重启。")
+        request_id = uuid.uuid4().hex
+        target = queue / (request_id + ".json")
+        stage = queue / (request_id + ".tmp")
+        record = {"schema": 1, "operation": "restart", "request_id": request_id,
+                  "requested_by_pid": os.getpid(), "created_at": datetime.now(timezone.utc).isoformat()}
         try:
-            task.Run("")
-        except Exception as exc:
-            # Remove only our unclaimed request. If a controller has claimed it,
-            # completion is unknown and must be checked, never blindly retried.
-            unclaimed = target.exists()
-            target.unlink(missing_ok=True)
-            code = "controller_start_failed" if unclaimed else "restart_state_unknown"
-            raise MaintenanceError(code, "维护启动未确认，请核对控制器回执；未自动重试。") from exc
+            with stage.open("x", encoding="utf-8", newline="\n") as stream:
+                json.dump(record, stream, ensure_ascii=False)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(stage, target)
+            try:
+                task.Run("")
+            except Exception as exc:
+                # Remove only our unclaimed request. If a controller has claimed it,
+                # completion is unknown and must be checked, never blindly retried.
+                withdrawn = queue / (request_id + ".withdrawn")
+                try:
+                    os.replace(target, withdrawn)
+                except FileNotFoundError:
+                    code = "restart_state_unknown"
+                else:
+                    withdrawn.unlink(missing_ok=True)
+                    code = "controller_start_failed"
+                raise MaintenanceError(code, "维护启动未确认，请核对控制器回执；未自动重试。") from exc
+        finally:
+            stage.unlink(missing_ok=True)
+        return {**base, "accepted": True, "request_created": True, "request_id": request_id,
+                "restart_completed": False,
+                "report_path": str(home / "state" / "core-controller-report.json"),
+                "message": "重启请求已提交。请按请求编号核对控制器完成回执，提交不等于重启成功。"}
     finally:
-        stage.unlink(missing_ok=True)
-    return {**base, "accepted": True, "request_created": True, "request_id": request_id,
-            "restart_completed": False,
-            "report_path": str(home / "state" / "core-controller-report.json"),
-            "message": "重启请求已提交。请按请求编号核对控制器完成回执，提交不等于重启成功。"}
+        guard.close()
+
 
 
 def main(argv: list[str] | None = None) -> int:

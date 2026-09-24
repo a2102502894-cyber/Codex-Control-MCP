@@ -211,12 +211,27 @@ def consume_requests(path: Path) -> tuple[str, list[dict[str, Any]]]:
         except (FileNotFoundError, PermissionError):
             continue
         try:
-            request = json.loads(claimed.read_text("utf-8-sig"))
+            # Bound input before parsing and reject future-dated requests.
+            # Otherwise an invalid timestamp can remain actionable indefinitely.
+            with claimed.open("rb") as stream:
+                raw = stream.read(16385)
+            if len(raw) > 16384:
+                raise ValueError("request_size_limit")
+            request = json.loads(raw.decode("utf-8-sig"))
+            if not isinstance(request, dict):
+                raise ValueError("request_object_required")
+            schema = request.get("schema", 1)
+            if type(schema) is not int or schema != 1:
+                raise ValueError("request_schema_invalid")
             created = datetime.fromisoformat(str(request["created_at"]).replace("Z", "+00:00"))
-            if request.get("operation") not in {"restart", "recover"} or utc_now() - created > timedelta(minutes=5):
+            age = utc_now() - created
+            if request.get("operation") not in {"restart", "recover"} or not timedelta(seconds=-30) <= age <= timedelta(minutes=5):
                 invalid = True
             else:
-                requests.append(request)
+                # Unknown fields must not be copied into maintenance reports.
+                requests.append({key: request[key] for key in (
+                    "schema", "operation", "request_id", "requested_by_pid", "created_at"
+                ) if key in request})
         except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError, UnicodeError):
             invalid = True
         finally:
