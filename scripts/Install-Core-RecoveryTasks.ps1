@@ -2,13 +2,15 @@ param(
   [switch]$Apply,
   [string]$Root=(Split-Path $PSScriptRoot -Parent),
   [string]$CcmHome=(Join-Path $env:USERPROFILE '.codex-control-mcp'),
-  [string]$ExpectedVersion='0.2.0'
+  [string]$ExpectedVersion='0.2.0',
+  [int]$ExpectedToolCount=47
 )
 $ErrorActionPreference='Stop'
 $state=Join-Path $CcmHome 'state'
 $python=Join-Path $Root '.venv\Scripts\python.exe'
 $hostScript=Join-Path $Root 'scripts\Core-Source-Host.ps1'
 $controller=Join-Path $Root 'scripts\core_recovery_controller.py'
+$resolver=Join-Path $Root 'scripts\lkg_state.py'
 $watchdogSource=Join-Path $Root 'scripts\Service-Watchdog.ps1'
 $watchdogTarget=Join-Path $state 'service-watchdog.ps1'
 $watchdogLauncher=Join-Path $state 'service-watchdog-hidden.vbs'
@@ -21,20 +23,26 @@ $currentTask='Codex-Control-MCP-Core-Current'
 $lkgTask='Codex-Control-MCP-Core-LKG'
 $controllerTask='Codex-Control-MCP-Core-Controller'
 $watchdogTask='Codex-Control-MCP-Watchdog'
-foreach($path in @($python,$hostScript,$controller,$watchdogSource)){
+foreach($path in @($python,$hostScript,$controller,$watchdogSource,$resolver)){
   if(-not (Test-Path -LiteralPath $path)){throw "Required path missing: $path"}
 }
-$lkg=Join-Path $state "lkg-$ExpectedVersion\src"
+$selectionJson=& $python -I $resolver --home $CcmHome
+if($LASTEXITCODE -ne 0){throw 'LKG selection or fingerprint validation failed'}
+$selection=$selectionJson | ConvertFrom-Json
+$currentJson=& $python -I $resolver --source-root $Root
+if($LASTEXITCODE -ne 0){throw 'Current source isolated probe failed'}
+$current=$currentJson | ConvertFrom-Json
+$lkg=$selection.source_root
 if(-not (Test-Path -LiteralPath $lkg)){throw "Required LKG missing: $lkg"}
 $config=[ordered]@{
-  schema=1; home=$CcmHome; port=8774; expected_version=$ExpectedVersion; expected_tool_count=47; probe_timeout_seconds=12
+  schema=1; home=$CcmHome; port=8774; expected_version=$ExpectedVersion; expected_tool_count=$ExpectedToolCount; probe_timeout_seconds=12
   lease=$leasePath; lease_seconds=300; report=$reportPath; request=$requestPath
   stop_timeout_seconds=20
   host_tasks=@($coreTask,$currentTask,$lkgTask)
   candidates=@(
-    [ordered]@{name='formal_task';task=$coreTask;timeout_seconds=35;expected_tool_count=47},
-    [ordered]@{name='current_source_direct';task=$currentTask;timeout_seconds=25;expected_tool_count=47},
-    [ordered]@{name='lkg_direct';task=$lkgTask;timeout_seconds=25;expected_tool_count=47}
+    [ordered]@{name='formal_task';task=$coreTask;timeout_seconds=35;expected_version=$ExpectedVersion;expected_tool_count=$ExpectedToolCount},
+    [ordered]@{name='current_source_direct';task=$currentTask;timeout_seconds=25;expected_version=$current.version;expected_tool_count=$current.core_tools},
+    [ordered]@{name='lkg_direct';task=$lkgTask;timeout_seconds=25;expected_version=$selection.version;expected_tool_count=$selection.expected_tool_count}
   )
 }
 $plan=[ordered]@{
@@ -84,7 +92,7 @@ function Register-OwnedTask([string]$Name,$Action,$Triggers=$null,$TaskSettings=
   }
 }
 $currentAction=New-ScheduledTaskAction -Execute $psExe -Argument ('-WindowStyle Hidden -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "'+$hostScript+'" -Mode current -Root "'+$Root+'" -CcmHome "'+$CcmHome+'"') -WorkingDirectory $Root
-$lkgAction=New-ScheduledTaskAction -Execute $psExe -Argument ('-WindowStyle Hidden -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "'+$hostScript+'" -Mode lkg -Root "'+$Root+'" -CcmHome "'+$CcmHome+'"') -WorkingDirectory $lkg
+$lkgAction=New-ScheduledTaskAction -Execute $psExe -Argument ('-WindowStyle Hidden -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "'+$hostScript+'" -Mode lkg -Root "'+$Root+'" -CcmHome "'+$CcmHome+'"') -WorkingDirectory $state
 $controllerAction=New-ScheduledTaskAction -Execute $python -Argument ('"'+$controller+'" --config "'+$configPath+'"') -WorkingDirectory $Root
 $watchdogAction=New-ScheduledTaskAction -Execute $wscriptExe -Argument ('//B //Nologo "'+$watchdogLauncher+'"') -WorkingDirectory $state
 Register-OwnedTask $currentTask $currentAction

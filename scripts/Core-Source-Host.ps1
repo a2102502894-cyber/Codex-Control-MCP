@@ -7,7 +7,11 @@ $ErrorActionPreference='Stop'
 $python=Join-Path $Root '.venv\Scripts\python.exe'
 if(-not (Test-Path -LiteralPath $python)){ throw "Python is missing: $python" }
 if($Mode -eq 'lkg'){
-  $lkg=Join-Path $CcmHome 'state\lkg-0.2.0\src'
+  $resolver=Join-Path $Root 'scripts\lkg_state.py'
+  $selectionJson=& $python -I $resolver --home $CcmHome
+  if($LASTEXITCODE -ne 0){throw 'LKG selection or fingerprint validation failed'}
+  $selection=$selectionJson | ConvertFrom-Json
+  $lkg=$selection.source_root
   if(-not (Test-Path -LiteralPath $lkg)){ throw "LKG is missing: $lkg" }
   $env:PYTHONPATH=$lkg
   $working=$lkg

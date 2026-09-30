@@ -65,7 +65,7 @@
 - 实现：Windows 默认 shell 保持 PowerShell，POSIX 默认 /bin/sh，显式支持 sh/bash。路径以结构化 argv 交给 Python3 标准库的文件大小/无覆盖移动辅助程序；不把路径拼进 shell，不在本机替代官方 RPC。健康探针选择对应平台语法。POSIX 移动 link+unlink 仅同文件系统、文件支持；unlink 故障可能留下双路径，保留事实并要求核验。
 - 版本：README、pyproject、__version__ 统一 0.2.2；README 新增真实能力矩阵、恢复/不可重执行边界、CUA 选择说明、账单不能等同零扣额、可复现命令；旧生产记录为历史证据。
 - CI：新增 Ubuntu/Windows、Python 3.11/3.12 的源码 compile 与非 integration 回归，15 分钟 job deadline，测试结果 artifact；无新凭据。CI 尚未远端运行，不能当作 Windows 实测。
-- 平台测试：原 38 项 OS/DPAPI 用例在非 Windows 显式跳过，Windows 仍运行；两个 controller 模块在导入 msvcrt 前声明平台依赖。真实官方 Runtime 的 lifecycle/OAuth transport 用例标 integration；工具数用当前 TOOL_SPECS 验证。WSL 纯单测隔离 NO_PROXY/no_proxy 环境，修正受云端既有环境污染的断言，不改任何代理配置。
+- 平台测试：39 个旧失败中，36 个在非 Windows 新增平台跳过，两个真实官方 Runtime 的 lifecycle/OAuth transport 用例新增 integration 标记而 deselected，1 个 WSL fixture 修正后通过。Windows 非 integration CI 会执行上述 36 个，但仍排除两个 integration 案例。两个 controller 模块在导入 msvcrt 前新增平台跳过。最终 60 skipped=22 个基线已有+2 个新模块级+36 个新用例级；20 deselected=18 个原有+2 个新增。测试函数未删除；跳过与排除都不算验证通过。工具数用当前 TOOL_SPECS 验证。WSL 纯单测隔离 NO_PROXY/no_proxy 环境，修正受云端既有环境污染的断言，不改任何代理配置。
 - 非目标：不改 DPAPI/权限分层，不为云端测试用明文 token 存储，不安装官方 runtime 到用户机器，不操作 SSH/Docker/Windows GUI 实机。
 
 ## 实际命令、结果与通过标准
@@ -92,7 +92,7 @@ python -m venv /workspace/ccm-venv
 
 1. 真实 Windows 官方 Codex/PTY/fs/Git、CUA GUI、Tabbit 实机、Windows DPAPI/stop event/Job Object、macOS、SSH、Docker 未验证。CI 尚未运行。
 2. 没有可核验的真实 CUA manifest fingerprint，不能在此环境给出已验证版本清单；本次不读取用户主机获取指纹。
-3. 基线 `scripts/freeze_source_lkg.py:32/45/53/56` 固定版本 0.2.0（基线包已为 0.2.1），旧发布记录也包含固定版本。新版 freeze/activate 需要父任务决定如何迁移 LKG 策略；本次未改/运行激活流程，未部署。此事项不阻塞源码实现/受控测试，但阻塞宣称正式发布已完成。
+3. 基线 freeze/host 固定版本 0.2.0 已按父任务授权增量修复，详见后面的 LKG 兼容补充；没有运行真实激活。真实 Windows 全栈证据仍缺失，full_stack_accepted=false，正式激活仍被证据门槛阻止。
 4. Fast 没有受支持的当前任务设置入口，未切换或冒称切换。普通执行不增加模型回合不代表官方账单零扣额。
 
 ## 回退与交付
@@ -112,3 +112,19 @@ git diff --check
 ```
 
 最后自查还修复了三个边界：注册表快照在锁外串行落盘；多个排队超时只取消 owner 一次，防止重复 cancel 打断清理；SessionStore 不淘汰尚未完成持久化的终态对象。已知终态或人工核验后的 execution 在对应有界 session 历史被淘汰时保持原终态，单独标注输出 unavailable，不把已确认结果退化为未知；未确认执行仍保持未知阻碍。会话启动记录失败时保留原始执行异常，不让保存错误替换它。相关实现之后重新运行了上面的最终全部检查。
+
+
+## LKG 版本兼容增量收尾
+
+- 增量基线：上一实现提交 `454da7ca85b9e48fc0a03dfdcbf84fe6c4912837`。审查原基线 freeze 在 `scripts/freeze_source_lkg.py:32` 固定 0.2.0/47，在 45/53/56/59 固定候选、manifest、目标和备份目录；host 在 `Core-Source-Host.ps1:10` 固定旧目录。0.2.2 probe 因版本失败；旧版 activate 后 probe 失败没有回滚，只有 rename 异常回滚。
+- 修改文件/函数：`freeze_source_lkg.py:freeze/main`；新增 `lkg_state.py:probe/validate_snapshot/snapshot_record/resolve_selection/selected_config/atomic_bytes/maintenance_guard/activate`；`Core-Source-Host.ps1` 的 lkg 选择；`Install-Core-RecoveryTasks.ps1` 的候选配置；`core_recovery_controller.py:run` 的选定配置读取；CI compile 增加 scripts。
+- 预期与非目标：支持不同版本/工具数的不可变源码快照，保留旧 `lkg-0.2.0` 入口。激活只改来源选择，不启动服务、安装任务、变更权限认证、清空数据库或重放命令。不宣称 Windows/PowerShell/调度实机已验证。
+- 实现：pyproject 与隔离导入包版本一致，工具数由 probe 实测；manifest schema=2 绑定源码逐文件散列/总散列、版本、工具数和原始验收。目录名绑定版本、源码散列与 manifest 散列；新验收建立新目录，不改写旧快照。active schema=1 指定 snapshot、版本、工具数、源码散列、manifest 散列；指纹不符、路径越界、symlink 或未知 schema 拒绝。没有 active 时保留旧 0.2.0/47 行为。
+- 配置一致性：active 是唯一原子来源/配置选择，原 controller JSON 不需要双写。host 解析同一记录；controller 获得既有 maintenance guard 后读取，用它仅覆盖 lkg_direct 的版本/工具数；formal/current 使用各自版本/工具数，installer 的 formal 期望仍显式参数化，current 隔离 probe 读取。
+- 错误/回退：共用永久 maintenance.lock.guard；已有 lease 拒绝激活，不删除 guard。前后隔离 probe，原子临时文件 flush/fsync/replace，POSIX 目录 fsync。异常恢复 previous 的精确字节或无 active 状态；覆盖写之前保存 rollback 记录。写入在 replace 后再报错也走回滚。回滚失败明确报错并保留 previous；存在未解决 rollback 记录时 host/controller 拒绝选定 LKG，须维护锁内人工检查与恢复，不能自动忽略。旧目录、静态 controller 配置始终不改写。
+- 门槛：输入与快照原始证据的 all_passed/full_stack_accepted 均须 true 才能真实激活。本次交付 full_stack_accepted=false。受控 fault fixture 的 synthetic true 只验证代码门槛，不是实机验收；测试临时目录不会接触实际 home/state。
+- 测试步骤/预期：临时构造 0.2.0/47、0.2.1/46、0.2.2/3 包并真正执行隔离导入；前/后 probe 故障分别检查 previous 存在/不存在恢复；备份/active 写入前及 replace 后故障检查原字节；copy/rename/probe 中途故障检查旧 LKG sentinel；篡改源码、manifest、active 字段或路径拒绝；版本/工具数 probe 不符拒绝；缺全栈证据在 probe 前拒绝；相同源码不同验收创建不同快照；回滚失败保留备份并阻止读取；共享 guard/既有 lease 阻止切换；当前仓库仅 freeze 到临时 home，证据 false，无 active 文件。以上 27 项无新增 skip。
+- 首次完整运行在新测试导入 scripts 时 collection error；headless wrapper 不把仓库根加入 sys.path。改为按确切脚本路径 importlib 加载，controller 也按相邻 helper 路径加载；未修改平台跳过规则，未删除测试。失败原始 log/XML 保留于交付 raw-evidence/lkg-collection-failure.*。
+- 最终命令：`python -m pytest tests/test_lkg_compatibility.py -q --tb=short --junitxml=evidence/durable-recovery/lkg-acceptance.xml`，27 passed；`python scripts/run_headless_tests.py tests -q -m 'not integration' --tb=short -o faulthandler_timeout=60 --junitxml=evidence/durable-recovery/lkg-final.xml`，312 passed / 60 skipped / 20 deselected、exit 0。`python -m compileall -q src scripts`、`python -m pip check`、`git diff --check` 通过。最终自查补充了 replace 后持久化报错的回滚，两项新故障测试后重新完成上述回归。
+- 选择范围：39 旧失败仍为 36 skip + 2 deselect + 1 pass，没有把 skip 当修复。本轮仅新增 27 个可移植测试，没有新增 skip/deselect。CI 原有 -k 另外排除 WSL availability 测试；远端 CI 未运行。Windows PowerShell/调度器、真正的 maintenance guard 集成与服务激活、突然进程死亡/电源中断未实测，原 Windows/CUA/SSH/Docker 等未验证项继续保留。
+- 迁移与源码回退：无需数据迁移，旧目录不变，无 active 即旧行为。若将来真实激活后回退 host 代码，须先在维护锁内恢复上一 active 选择/配置，并确保回退代码对应旧 lkg 路径；本次没有真实选择变更，无需操作用户状态。源码可 revert 此增量提交，保留已有持久化库和未知执行阻碍。

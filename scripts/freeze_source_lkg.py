@@ -1,72 +1,84 @@
-"""Freeze verified source plus recovery scripts; never package or include credentials."""
+"""Freeze immutable, verified source; activation switches a guarded selection only."""
 from __future__ import annotations
-import argparse, datetime, hashlib, json, os, pathlib, shutil, subprocess, sys, tempfile
-ROOT=pathlib.Path(__file__).resolve().parents[1]
-RECOVERY_FILES=['core_recovery_controller.py','Core-Source-Host.ps1','Request-Core-Restart.ps1','Install-Core-RecoveryTasks.ps1','Service-Watchdog.ps1']
 
-def tree_manifest(root):
-    rows=[]
-    for p in sorted(root.rglob('*')):
-        if p.is_file() and p.name!='manifest.json' and '__pycache__' not in p.parts:
-            rows.append({'path':p.relative_to(root).as_posix(),'bytes':p.stat().st_size,'sha256':hashlib.sha256(p.read_bytes()).hexdigest()})
-    digest=hashlib.sha256(json.dumps(rows,ensure_ascii=False,sort_keys=True,separators=(',',':')).encode('utf-8')).hexdigest()
-    return rows,digest
+import argparse
+import datetime
+import hashlib
+import json
+from pathlib import Path
+import shutil
+import tempfile
+import tomllib
 
-PROBE=r'''
-import json,sys,pathlib,tomllib
-root=pathlib.Path(sys.argv[1]).resolve()
-sys.path.insert(0,str(root/'src'))
-import codex_control_mcp as pkg
-from codex_control_mcp.tools import TOOL_SPECS
-from codex_control_mcp.config import Config,DEFAULT_CONFIG
-from codex_control_mcp.bridge import Bridge
-from codex_control_mcp.computer import OfficialComputer
-from codex_control_mcp.proxy_probe import route_is_verified
-origin=pathlib.Path(pkg.__file__).resolve()
-assert origin.is_relative_to(root/'src'),origin
-c=Config(home=root/'probe-unused-home',cwd=str(root))
-out={'version':pkg.__version__,'core_tools':len(TOOL_SPECS),
-     'static_grok_tools':sum(n.startswith('grok_') for n in TOOL_SPECS),
-     'static_director_tools':sum(n.startswith('director_') for n in TOOL_SPECS),
-     'default_port':tomllib.loads(DEFAULT_CONFIG)['http']['port'],'module_path':str(origin),'isolated_import':True}
-assert out['version']=='0.2.0' and out['core_tools']==47
-assert out['static_grok_tools']==out['static_director_tools']==0
-assert out['default_port']==8774
-print(json.dumps(out,ensure_ascii=False))
-'''
+try:
+    from .lkg_state import activate, atomic_bytes, probe, snapshot_record, tree_manifest
+except ImportError:
+    from lkg_state import activate, atomic_bytes, probe, snapshot_record, tree_manifest
+
+ROOT = Path(__file__).resolve().parents[1]
+RECOVERY_FILES = ['core_recovery_controller.py', 'Core-Source-Host.ps1', 'Request-Core-Restart.ps1',
+                  'Install-Core-RecoveryTasks.ps1', 'Service-Watchdog.ps1', 'lkg_state.py', 'freeze_source_lkg.py']
+
+
+def freeze(root, home, tests, *, probe_fn=probe):
+    if tests.get('all_passed') is not True:
+        raise ValueError('Final test evidence must be passing')
+    root, state = Path(root).resolve(), Path(home) / 'state'
+    version = tomllib.loads((root / 'pyproject.toml').read_text('utf-8'))['project']['version']
+    state.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix='lkg-candidate-', dir=state))
+    try:
+        shutil.copytree(root / 'src/codex_control_mcp', staging / 'src/codex_control_mcp',
+                        ignore=shutil.ignore_patterns('__pycache__', '*.pyc', '*.bak'))
+        (staging / 'scripts').mkdir()
+        for name in RECOVERY_FILES:
+            shutil.copy2(root / 'scripts' / name, staging / 'scripts' / name)
+        validation = probe_fn(staging, version, None)
+        rows, digest = tree_manifest(staging)
+        manifest = {'schema': 2, 'version': version, 'expected_tool_count': validation['core_tools'],
+                    'created_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    'source': str(root / 'src/codex_control_mcp'), 'sha256': digest,
+                    'sha256_algorithm': 'SHA256(canonical UTF8 JSON ordered file path/bytes/SHA256 rows; excludes manifest and pycache)',
+                    'file_count': len(rows), 'files': rows, 'validation': validation, 'tests': tests,
+                    'packaging_required': False}
+        manifest_bytes = json.dumps(manifest, ensure_ascii=False, indent=2).encode('utf-8')
+        atomic_bytes(staging / 'manifest.json', manifest_bytes)
+        # Evidence is immutable too: later acceptance creates a distinct snapshot.
+        identity = hashlib.sha256(manifest_bytes).hexdigest()[:16]
+        target = state / f'lkg-{version}-{digest[:16]}-{identity}'
+        if target.exists():
+            existing = snapshot_record(target, state)
+            if existing['sha256'] != digest or existing['version'] != version:
+                raise ValueError('Immutable LKG snapshot already exists with different contents')
+            # Retain its original acceptance evidence; never upgrade it in place.
+            return target
+        staging.rename(target)
+        snapshot_record(target, state)
+        return target
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging)
+
 
 def main():
-    parser=argparse.ArgumentParser();parser.add_argument('--home',type=pathlib.Path,default=pathlib.Path.home()/'.codex-control-mcp');parser.add_argument('--tests-json',type=pathlib.Path,required=True);parser.add_argument('--activate',action='store_true');a=parser.parse_args()
-    tests=json.loads(a.tests_json.read_text('utf-8'))
-    assert tests.get('all_passed') is True,'Final test evidence must be passing'
-    if a.activate:
-        assert tests.get('full_stack_accepted') is True,'Do not replace LKG while required production acceptance remains incomplete'
-    state=a.home/'state';stamp=datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
-    staging=state/('lkg-0.2.0.candidate-'+stamp);staging.mkdir()
-    shutil.copytree(ROOT/'src/codex_control_mcp',staging/'src/codex_control_mcp',ignore=shutil.ignore_patterns('__pycache__','*.pyc','*.bak'))
-    (staging/'scripts').mkdir()
-    for name in RECOVERY_FILES:shutil.copy2(ROOT/'scripts'/name,staging/'scripts'/name)
-    env=os.environ.copy();env['PYTHONPATH']=str(staging/'src');env['PYTHONIOENCODING']='utf-8';env['PYTHONDONTWRITEBYTECODE']='1'
-    checked=subprocess.run([sys.executable,'-I','-X','utf8','-c',PROBE,str(staging)],cwd=staging,env=env,capture_output=True,text=True,encoding='utf-8',timeout=40)
-    if checked.returncode:raise RuntimeError(checked.stderr)
-    validation=json.loads(checked.stdout);rows,digest=tree_manifest(staging)
-    manifest={'version':'0.2.0','created_at':datetime.datetime.now(datetime.timezone.utc).isoformat(),'source':str(ROOT/'src/codex_control_mcp'),
-              'sha256':digest,'sha256_algorithm':'SHA256(canonical UTF8 JSON ordered file path/bytes/SHA256 rows; excludes manifest and pycache)',
-              'file_count':len(rows),'files':rows,'validation':validation,'tests':tests,'packaging_required':False}
-    target=state/'lkg-0.2.0';previous=None
-    if a.activate:
-        if target.exists():
-            previous=state/('lkg-0.2.0.previous-'+stamp);target.rename(previous)
-        try:staging.rename(target)
-        except BaseException:
-            if previous and not target.exists():previous.rename(target)
-            raise
-        staging=target
-        final=subprocess.run([sys.executable,'-I','-X','utf8','-c',PROBE,str(target)],cwd=target,env=env,capture_output=True,text=True,encoding='utf-8',timeout=40)
-        if final.returncode:raise RuntimeError(final.stderr)
-        manifest['validation']=json.loads(final.stdout)
-    manifest['activated']=a.activate;manifest['previous_snapshot']=str(previous) if previous else None
-    (staging/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
-    assert tree_manifest(staging)[1]==digest
-    print(json.dumps({'path':str(staging),'sha256':digest,'file_count':len(rows),'validation':manifest['validation'],'activated':a.activate,'previous':manifest['previous_snapshot']},ensure_ascii=False,indent=2))
-if __name__=='__main__':main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--home', type=Path, default=Path.home() / '.codex-control-mcp')
+    parser.add_argument('--tests-json', type=Path, required=True)
+    parser.add_argument('--activate', action='store_true')
+    parser.add_argument('--snapshot', type=Path, help='Activate an existing immutable snapshot with its original evidence')
+    args = parser.parse_args()
+    tests = json.loads(args.tests_json.read_text('utf-8'))
+    if tests.get('all_passed') is not True:
+        raise ValueError('Final test evidence must be passing')
+    if args.activate and tests.get('full_stack_accepted') is not True:
+        raise ValueError('Do not activate without full-stack acceptance evidence')
+    if args.snapshot and not args.activate:
+        parser.error('--snapshot requires --activate')
+    snapshot = args.snapshot or freeze(ROOT, args.home, tests)
+    selection = activate(args.home, snapshot) if args.activate else None
+    print(json.dumps({'path': str(snapshot), 'selection': selection, 'activated': args.activate,
+                      'full_stack_accepted': tests.get('full_stack_accepted') is True}, ensure_ascii=False, indent=2))
+
+
+if __name__ == '__main__':
+    main()

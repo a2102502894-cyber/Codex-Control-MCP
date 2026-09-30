@@ -9,7 +9,7 @@
     "skipped": 0
   },
   "full_runnable": {
-    "passed": 285,
+    "passed": 312,
     "failed": 0,
     "skipped": 60
   },
@@ -32,16 +32,36 @@
     "macOS",
     "SSH",
     "Docker",
-    "GitHub Actions not run"
+    "GitHub Actions not run",
+    "Windows PowerShell host/installer and real LKG activation",
+    "Windows maintenance guard integration",
+    "Abrupt process death or power-loss activation recovery"
   ],
   "speed_setting": "No supported current-task Fast setting interface exposed",
   "deployment": "No push/PR/merge/deploy; no user machine or auth/permission config changes",
-  "publication_blocker": "Baseline freeze_source_lkg.py hardcodes 0.2.0; parent decision required before LKG activation",
+  "publication_blocker": "Windows full-stack acceptance unavailable; real LKG activation prohibited. Fixed-version compatibility code implemented and fixture-tested only.",
   "raw_evidence_sha256": {
     "baseline.log": "e37ff286971d5214303052b139db37f8ba58fbff39466e33fbe93e1ab364149b",
     "baseline.xml": "090027c7fb35843e6286c081f83ebbdcc02221a1440cd1b0855c71d7307690f7",
     "full.log": "3f70ffce95d1115f9c211af1fa79612819d00c3026bc235e85e0f8856cafee28",
     "full.xml": "a12b0ba99b989b65a52d22feacf95082c418bc96db429a492bcc60687fd5570b"
   },
-  "tracked_log_normalization": "Trailing whitespace only; original bytes retained in delivery/raw-evidence"
+  "tracked_log_normalization": "Trailing whitespace only; original bytes retained in delivery/raw-evidence",
+  "historical_full_runnable": {
+    "passed": 285,
+    "failed": 0,
+    "skipped": 60
+  },
+  "lkg_acceptance": {
+    "passed": 27,
+    "failed": 0,
+    "skipped": 0
+  },
+  "full_stack_accepted": false,
+  "lkg_checks": {
+    "compileall_src_scripts": "PASS",
+    "pip_check": "PASS",
+    "no_actual_activation": true,
+    "selection_config_single_atomic_record": true
+  }
 }

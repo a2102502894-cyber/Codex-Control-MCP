@@ -191,7 +191,7 @@ HTTPS 计划任务 `Codex-Control-MCP-HTTPS-OnDemand` 同样使用该 venv 运�
 
 正式任务具备 AtStartup/AtLogon，使用用户交互式会话，不保存用户密码或改用 S4U。已验真实冷启动；**未通过注销或重启 Windows 验证登录/开机，不宣称无人登录前可用**。
 
-当前 LKG：`%USERPROFILE%\.codex-control-mcp\state\lkg-0.2.0`。
+旧 LKG 入口：`%USERPROFILE%\.codex-control-mcp\state\lkg-0.2.0`。 没有 `lkg-active.json` 时仍使用它；新快照由 active 选择记录指定。本次云端未执行真实激活。
 
 ## 外部组件边界
 
@@ -219,7 +219,13 @@ HTTPS 计划任务 `Codex-Control-MCP-HTTPS-OnDemand` 同样使用该 venv 运�
 
 ## LKG 与证据范围
 
-`scripts/freeze_source_lkg.py` 可生成独立源码候选、隔离导入核对 0.2.0/47 工具/无静态 Grok 或 Director/默认 8774，并写 UTF-8 manifest 与逐文件 SHA256。默认只生成候选；只有验收范围明确且通过后才使用 `--activate`。快照不包含凭据；外部 MCP 的业务能力不属于本项目 LKG 认证范围，`packaging_required=false`。
+`scripts/freeze_source_lkg.py --tests-json <证据.json>` 默认只生成不可变版本化源码候选。隔离 probe 将 pyproject 版本与实际包版本核对，记录实际工具数，并校验无静态 Grok/Director 与默认端口 8774。manifest 绑定版本、工具数、逐文件 SHA256 和证据；相同源码的后续验收生成另一快照，不改写旧证据。快照不包含凭据；外部 MCP 业务能力不属于本项目 LKG 认证范围，`packaging_required=false`。
+
+激活要求输入及快照原有证据均为 `all_passed=true`、`full_stack_accepted=true`。本次云端缺真实 Windows 全栈证据，交付中 `full_stack_accepted=false`，不能用于正式激活。已通过实机验收后才可使用 `--activate`；`--snapshot <路径>` 选择已冻结且有原始验收证据的快照。激活只切换选择，不启动服务、不清空状态库、不重放命令。
+
+新的 `scripts/lkg_state.py` 在 controller 的维护 guard 下核验指纹、执行前后隔离 probe，并原子替换单个 `state/lkg-active.json`。该记录同时指定来源、版本与工具数；host 与 controller 共用它，formal/current 候选保持各自的期望版本/工具数。失败恢复上一选择，旧 `lkg-0.2.0` 目录从不被重命名或覆盖。回滚失败或进程中断留下 `lkg-active.rollback.json` 时，host/controller 拒绝启动选定 LKG；在维护锁内人工检查记录、恢复其 previous 原始选择（null 表示删除 active 选择）并核验后，才能移除 rollback 记录。不得绕过该阻碍重发未知业务命令。
+
+受控验证命令：`python -m pytest tests/test_lkg_compatibility.py -q`。它验证临时目录中的快照/选择故障，不能证明 Windows PowerShell、Scheduler、DPAPI、实机服务切换或电源中断已验收。安装器 `ExpectedVersion/ExpectedToolCount` 描述 formal 候选；current 从隔离 probe 读取，LKG 从 active 记录读取，无记录则保持旧 0.2.0/47。
 
 
 

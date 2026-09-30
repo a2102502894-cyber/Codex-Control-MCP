@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import ctypes
+import importlib.util
 from datetime import datetime, timedelta, timezone
 import json
 import os
@@ -316,6 +317,12 @@ def run(config_path: Path) -> int:
             report["error"] = "active_maintenance_lease"
             code = EXIT_LEASE_HELD
             return code
+        # Read selection only after acquiring the guard shared with activation.
+        # Formal/current pins stay independent of the selected LKG version.
+        spec = importlib.util.spec_from_file_location('controller_lkg_state', Path(__file__).with_name('lkg_state.py'))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        config = module.selected_config(config)
         report["operation"], report["requests"] = consume_requests(Path(config["request"]))
         if report["operation"] == "invalid":
             report["error"] = "invalid_or_expired_request"

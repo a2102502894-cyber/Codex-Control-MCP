@@ -1,0 +1,5 @@
+python -m compileall -q src scripts: exit 0
+python -m pip check: exit 0; No broken requirements found.
+git diff --check: exit 0
+PowerShell unavailable; real Windows host/installer/activation not run.
+full_stack_accepted=false
