@@ -6,6 +6,42 @@ from __future__ import annotations
 import asyncio, concurrent.futures, json, os, pathlib, queue, threading, uuid
 from .common import digest
 from .errors import BridgeError
+from jsonschema import Draft7Validator
+
+
+def select_manifest(base, compatibility):
+    """Use an explicitly verified version/fingerprint, never newest-by-mtime."""
+    if not isinstance(compatibility, dict):
+        raise BridgeError("version_incompatible", "CUA compatibility selection must be an object.")
+    version = compatibility.get("version")
+    fingerprint = compatibility.get("manifest_sha256")
+    if not isinstance(version, str) or not version or pathlib.Path(version).name != version or version in (".", "..") or not isinstance(fingerprint, str) or len(fingerprint) != 64:
+        raise BridgeError("version_incompatible", "CUA requires an explicitly verified cua_compatibility.version and manifest_sha256. No unverified plugin is launched.")
+    manifest = base / version / ".mcp.json"
+    try:
+        raw = manifest.read_bytes()
+        if digest(raw) != fingerprint:
+            raise BridgeError("version_incompatible", "CUA manifest fingerprint differs from the verified selection.", details={"version": version, "expected_manifest_sha256": fingerprint, "actual_manifest_sha256": digest(raw)})
+        config = json.loads(raw)["mcpServers"]["cua_repl"]
+        if not isinstance(config, dict) or not isinstance(config.get("env"), dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in config["env"].items()):
+            raise ValueError("Invalid CUA manifest contract")
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise BridgeError("version_incompatible", "Selected CUA manifest is missing or incompatible; no fallback version is launched.") from exc
+    return manifest, config
+
+
+def probe_tool_contract(tools):
+    tool = next((t for t in tools if t.name == "js"), None)
+    request = {"code": "nodeRepl.write('CCM_CONTRACT=1')", "title": "Read-only CUA contract probe", "timeout_ms": 1000}
+    try:
+        schema = tool.inputSchema if tool else None
+        if not schema or schema.get("type") != "object" or not {"code", "title", "timeout_ms"}.issubset(schema.get("properties", {})):
+            raise ValueError("Missing js request fields")
+        Draft7Validator.check_schema(schema)
+        Draft7Validator(schema).validate(request)
+    except Exception as exc:
+        raise BridgeError("version_incompatible", "Selected CUA plugin does not expose the supported js request contract.") from exc
+
 
 
 class OfficialComputer:
@@ -40,13 +76,15 @@ class OfficialComputer:
             )
         if self.error:
             self.close()
+            if isinstance(self.error, BridgeError):
+                raise self.error
             raise BridgeError("capability_unavailable", self.error)
 
     def _entry(self):
         try:
             asyncio.run(self._run())
         except BaseException as e:
-            self.error = f"Official CUA plugin stopped ({type(e).__name__})."
+            self.error = e if isinstance(e, BridgeError) else f"Official CUA plugin stopped ({type(e).__name__})."
             self.ready.set()
         finally:
             self.closed = True
@@ -86,16 +124,7 @@ class OfficialComputer:
             pathlib.Path.home()
             / ".codex/plugins/cache/openai-bundled/unified-computer-use"
         )
-        manifests = sorted(
-            base.glob("*/.mcp.json"), key=lambda p: p.stat().st_mtime_ns, reverse=True
-        )
-        if not manifests:
-            raise BridgeError(
-                "capability_unavailable",
-                "Official installed CUA plugin manifest was not found.",
-            )
-        manifest = manifests[0]
-        c = json.loads(manifest.read_text("utf-8"))["mcpServers"]["cua_repl"]
+        manifest, c = select_manifest(base, getattr(self.cfg, "cua_compatibility", {}))
         official_env = dict(c.get("env") or {})
         node_repl_value = official_env.get("CUA_REPL_NODE_REPL_PATH")
         if not isinstance(node_repl_value, str) or not node_repl_value.strip():
@@ -188,11 +217,17 @@ class OfficialComputer:
                 ) as session:
                     await session.initialize()
                     listed = await session.list_tools()
-                    if not any(t.name == "js" for t in listed.tools):
-                        raise BridgeError(
-                            "version_incompatible",
-                            "Official CUA plugin no longer exposes js.",
-                        )
+                    probe_tool_contract(listed.tools)
+                    # This probe checks only JavaScript API shape, without desktop
+                    # access, browser navigation, or model calls.
+                    probe = await session.call_tool("js", {
+                        "code": "nodeRepl.write('CCM_CONTRACT='+JSON.stringify({nodeRepl:typeof nodeRepl.write==='function',cua:typeof cua==='object'}))",
+                        "title": "Read-only CUA API contract probe", "timeout_ms": 1000,
+                    })
+                    texts = [x.text for x in probe.content if getattr(x, "type", None) == "text"]
+                    if probe.isError or not any('CCM_CONTRACT={"nodeRepl":true,"cua":true}' in x for x in texts):
+                        raise BridgeError("version_incompatible", "Selected CUA plugin failed the read-only API contract probe; no fallback is launched.")
+                    self.info["compatibility_contract"] = "js-request-and-api-v1"
                     self.ready.set()
                     while True:
                         item = await asyncio.to_thread(self.requests.get)

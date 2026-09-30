@@ -44,7 +44,9 @@ class RecoverableTaskStore:
         self.db.execute(
             "CREATE INDEX IF NOT EXISTS idx_tasks_status_updated ON tasks(status,updated_at DESC)"
         )
+        self.db.execute("CREATE TABLE IF NOT EXISTS executions(operation_id TEXT PRIMARY KEY,task_id TEXT NOT NULL,doc TEXT NOT NULL)")
         self.db.commit()
+        self.session_reader = None
 
     def _load(self, task_id):
         task_id = _txt(task_id, "task_id", True, 256)
@@ -87,11 +89,12 @@ class RecoverableTaskStore:
         task["updated_at"] = utc_now()
         task["events"] = list(task.get("events") or [])[-256:]
         raw = json.dumps(task, ensure_ascii=False, separators=(",", ":"))
-        self.db.execute(
-            "UPDATE tasks SET status=?,updated_at=?,doc=? WHERE id=?",
-            (task["status"], task["updated_at"], raw, task["id"]),
-        )
-        self.db.commit()
+        changed = self.db.execute(
+                "UPDATE tasks SET status=?,updated_at=?,doc=? WHERE id=? AND json_extract(doc,'$.revision')=?",
+                (task["status"], task["updated_at"], raw, task["id"], revision),
+            ).rowcount
+        if changed != 1:
+            raise BridgeError("task_revision_conflict", "Task changed since it was read.")
         return copy.deepcopy(task)
 
     def create(self, args):
@@ -178,10 +181,11 @@ class RecoverableTaskStore:
         return {"action": "get", "task": task, "state_path": str(self.path)}
 
     def checkpoint(self, args):
-        with self.lock:
+        with self.lock, self.db:
             task = self._load(args.get("task_id"))
             if task["status"] == "completed":
                 raise BridgeError("task_completed", "Completed tasks cannot be checkpointed.")
+            task["final_review"] = None
             by_id = {s["id"]: s for s in task.get("steps") or []}
             step_id = _txt(args.get("step_id"), "step_id", False, 256)
             step_status = _txt(args.get("step_status"), "step_status", False, 64).lower()
@@ -220,7 +224,7 @@ class RecoverableTaskStore:
         return {"action": "checkpoint", "task_id": saved["id"], "task_summary": self._summary(saved), "state_path": str(self.path)}
 
     def block(self, args):
-        with self.lock:
+        with self.lock, self.db:
             task = self._load(args.get("task_id"))
             summary = _txt(args.get("summary"), "summary", True, 8192)
             if task["status"] == "completed":
@@ -233,11 +237,14 @@ class RecoverableTaskStore:
         return {"action": "block", "task_id": saved["id"], "task_summary": self._summary(saved), "state_path": str(self.path)}
 
     def resume(self, args):
-        with self.lock:
+        with self.lock, self.db:
             task = self._load(args.get("task_id"))
             if task["status"] == "completed":
                 raise BridgeError("task_completed", "Completed tasks cannot be resumed.")
             summary = _txt(args.get("summary"), "summary", False, 8192)
+            if self._unresolved(task["id"]):
+                raise BridgeError("task_execution_unresolved", "Inspect recover and verify unknown or active executions before resume.")
+            task["final_review"] = None
             task["status"] = "active"
             task["blocker"] = ""
             if summary:
@@ -250,7 +257,7 @@ class RecoverableTaskStore:
         review_status = _txt(args.get("review_status"), "review_status", True, 64).lower()
         if review_status not in {"pass", "failed"}:
             raise BridgeError("invalid_arguments", "review_status must be pass or failed.")
-        with self.lock:
+        with self.lock, self.db:
             task = self._load(args.get("task_id"))
             if task["status"] == "completed":
                 raise BridgeError("task_completed", "Completed tasks cannot be reviewed again.")
@@ -271,10 +278,12 @@ class RecoverableTaskStore:
         return {"action": "final_review", "task_id": saved["id"], "task_summary": self._summary(saved), "final_review": review, "state_path": str(self.path)}
 
     def complete(self, args):
-        with self.lock:
+        with self.lock, self.db:
             task = self._load(args.get("task_id"))
             if task["status"] == "completed":
                 return {"action": "complete", "task_id": task["id"], "task_summary": self._summary(task), "already_completed": True, "state_path": str(self.path)}
+            if self._unresolved(task["id"]):
+                raise BridgeError("task_execution_unresolved", "Unknown or active executions must be verified before completion.")
             incomplete = [s["id"] for s in task.get("steps") or [] if s["status"] != "completed"]
             if incomplete:
                 raise BridgeError("task_incomplete", "All task steps must be completed before closeout.", details={"incomplete_step_ids": incomplete})
@@ -288,12 +297,100 @@ class RecoverableTaskStore:
             saved = self._save(task, args.get("expected_revision"))
         return {"action": "complete", "task_id": saved["id"], "task_summary": self._summary(saved), "state_path": str(self.path)}
 
+    def executions(self, task_id):
+        with self.lock:
+            rows = self.db.execute("SELECT doc FROM executions WHERE task_id=? ORDER BY rowid", (task_id,)).fetchall()
+        out = []
+        for row in rows:
+            item = json.loads(row[0])
+            sid = item.get("session_id")
+            if sid and self.session_reader:
+                try:
+                    session = self.session_reader(sid)
+                    item["session_output"] = session
+                    item["cursor"] = session["next_cursor"]
+                    if item["state"] not in ("verified_completed", "verified_failed"):
+                        item["state"] = {"exited": "completed", "failed": "failed", "lost": "unknown"}.get(session["state"], "running")
+                except BridgeError:
+                    item["session_output_availability"] = "unavailable"
+                    if item["state"] not in ("completed", "failed", "verified_completed", "verified_failed"):
+                        item["state"] = "unknown"
+            out.append(item)
+        return out
+
+    def _unresolved(self, task_id):
+        return [x for x in self.executions(task_id) if x["state"] not in ("completed", "failed", "verified_completed", "verified_failed")]
+
+    def begin_execution(self, task_id, step_id, operation_id, tool):
+        with self.lock, self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            task = self._load(task_id)
+            if task["status"] != "active" or self._unresolved(task_id):
+                raise BridgeError("task_execution_unresolved", "Task must be active with no unverified execution before dispatch.")
+            if step_id not in {s["id"] for s in task.get("steps", [])}:
+                raise BridgeError("invalid_arguments", "Execution requires a valid task step_id.")
+            item = {"version": 1, "task_id": task_id, "step_id": step_id, "operation_id": operation_id,
+                    "tool": tool, "state": "started", "session_id": None, "runtime_generation": None,
+                    "cursor": 0, "created_at": utc_now()}
+            self.db.execute("INSERT INTO executions VALUES(?,?,?)", (operation_id, task_id, json.dumps(item)))
+            task["final_review"] = None
+            self._save(task)
+        return item
+
+    def link_execution(self, operation_id, **fields):
+        with self.lock, self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            row = self.db.execute("SELECT doc FROM executions WHERE operation_id=?", (operation_id,)).fetchone()
+            if not row:
+                raise BridgeError("task_execution_missing", "Execution association is missing; dispatch refused.")
+            item = json.loads(row[0])
+            item.update(fields)
+            self.db.execute("UPDATE executions SET doc=? WHERE operation_id=?", (json.dumps(item), operation_id))
+
+    def recover(self, args):
+        task = self.get(args)["task"]
+        executions = self.executions(task["id"])
+        return {"action": "recover", "task": task, "executions": executions,
+                "unknown_terminal_operations": [x["operation_id"] for x in executions if x["state"] not in ("running", "completed", "failed", "verified_completed", "verified_failed")],
+                "next_required_action": "Read stored output and verify external effects. Resolve unknown executions with evidence; checkpoint steps and repeat final_review. No command is replayed.",
+                "automatic_replay": False, "state_path": str(self.path)}
+
+    def resolve_execution(self, args):
+        state = args.get("execution_resolution")
+        if state not in ("verified_completed", "verified_failed"):
+            raise BridgeError("invalid_arguments", "execution_resolution must be verified_completed or verified_failed.")
+        summary = _txt(args.get("summary"), "summary", True, 8192)
+        evidence = [_txt(x, "evidence[]", True, 4096) for x in args.get("evidence", [])]
+        if not evidence:
+            raise BridgeError("invalid_arguments", "Explicit verification evidence is required.")
+        with self.lock, self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            task = self._load(args.get("task_id"))
+            if task["status"] == "completed":
+                raise BridgeError("task_completed", "Completed tasks cannot be changed.")
+            operation_id = args.get("execution_operation_id")
+            records = self.executions(task["id"])
+            record = next((x for x in records if x["operation_id"] == operation_id), None)
+            if not record:
+                raise BridgeError("task_execution_missing", "Operation is not associated with this task.")
+            if record.get("session_output", {}).get("state") in ("starting", "running"):
+                raise BridgeError("task_execution_unresolved", "A live session cannot be resolved as terminal.")
+            record.pop("session_output", None)
+            record.update(state=state, verification_summary=summary, verification_evidence=evidence)
+            self.db.execute("UPDATE executions SET doc=? WHERE operation_id=?", (json.dumps(record), operation_id))
+            task["final_review"] = None
+            task["events"].append(_event("execution_verified", summary))
+            saved = self._save(task, args.get("expected_revision"))
+        return {"action": "resolve_execution", "task_summary": self._summary(saved), "operation_id": operation_id}
+
     def manage(self, args):
         action = _txt(args.get("action"), "action", True, 64).lower()
         handlers = {
             "create": self.create,
             "list": self.list,
             "get": self.get,
+            "recover": self.recover,
+            "resolve_execution": self.resolve_execution,
             "checkpoint": self.checkpoint,
             "block": self.block,
             "resume": self.resume,

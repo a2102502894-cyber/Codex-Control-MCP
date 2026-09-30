@@ -4,6 +4,9 @@ import json
 from pathlib import Path
 from datetime import timedelta
 
+import pytest
+pytest.importorskip("msvcrt", reason="Windows controller OS lease tests")
+
 SPEC=importlib.util.spec_from_file_location('recovery',Path(__file__).resolve().parents[1]/'scripts/core_recovery_controller.py')
 c=importlib.util.module_from_spec(SPEC);SPEC.loader.exec_module(c)
 

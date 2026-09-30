@@ -104,6 +104,7 @@ def test_dynamic_mcp_stdio_refresh_search_inspect_call_and_redaction(tmp_path):
         manager.call({"name": "fixture:echo", "arguments": {}})
     called = manager.call({"name": "fixture:echo", "arguments": {"text": "hello"}})
     assert called["result"]["structuredContent"]["echo"] == "hello"
+    manager.close()
 
 
 def _skill_dir(root: Path, version: str, body: str):

@@ -43,9 +43,7 @@ def test_idempotency_conflict_and_replay(tmp_path):
     assert e.value.code == "idempotency_conflict"
     a.close()
     a = Idempotency(p)
-    with pytest.raises(BridgeError) as e:
-        a.reserve("k", "tool", {"x": 1})
-    assert e.value.code == "execution_state_unknown"
+    assert a.reserve("k", "tool", {"x": 1}) == {"ok": True}
     a.close()
 
 
@@ -111,7 +109,7 @@ def test_inference_and_unreviewed_rpc_absent(method):
     "tool,args",
     [
         ("read_file", {}),
-        ("exec_command", {"shell": "sh"}),
+        ("exec_command", {"shell": "unsupported"}),
         ("session_read", {"session_id": "x", "cursor": -1}),
         ("git_commit", {"paths": [], "message": "x"}),
         ("codex_health", {"unknown": True}),

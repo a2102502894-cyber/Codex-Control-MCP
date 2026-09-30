@@ -32,6 +32,7 @@ class Config:
     experimental: bool = True
     computer_use_enabled: bool = False
     browser_use_enabled: bool = False
+    cua_compatibility: dict = dataclasses.field(default_factory=dict)
     browser: dict = dataclasses.field(default_factory=dict)
     local_application_consent: bool = False
     auto_approve_application_access: bool = False

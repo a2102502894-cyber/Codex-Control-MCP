@@ -1,0 +1,17 @@
+WARNING: The directory '/home/agent/.cache/pip' or its parent directory is not owned or is not writable by the current user. The cache has been disabled. Check the permissions and owner of that directory. If executing pip with sudo, you should use sudo's -H flag.
+Processing /workspace/Codex-Control-MCP
+  Installing build dependencies: started
+  Installing build dependencies: finished with status 'done'
+  Getting requirements to build wheel: started
+  Getting requirements to build wheel: finished with status 'done'
+  Preparing metadata (pyproject.toml): started
+  Preparing metadata (pyproject.toml): finished with status 'done'
+Building wheels for collected packages: codex-control-mcp
+  Building wheel for codex-control-mcp (pyproject.toml): started
+  Building wheel for codex-control-mcp (pyproject.toml): finished with status 'done'
+  Created wheel for codex-control-mcp: filename=codex_control_mcp-0.2.2-py3-none-any.whl size=117083 sha256=5f192a4136874855542e09fcb13dcd8fcb689ea3dad90b8a269bde2944b2a423
+  Stored in directory: /tmp/pip-ephem-wheel-cache-m_hv0xuu/wheels/53/8b/b6/1319dc7174dfb3a7611656e8c9a8781c19dc29fd12d09b56df
+Successfully built codex-control-mcp
+
+[notice] A new release of pip is available: 25.0.1 -> 26.2.1
+[notice] To update, run: python -m pip install --upgrade pip

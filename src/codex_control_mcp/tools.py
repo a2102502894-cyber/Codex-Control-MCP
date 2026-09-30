@@ -42,10 +42,12 @@ def definition(description, properties, required=(), read=False):
 
 
 EXEC = {
+    "task_id": S,
+    "step_id": S,
     "command": {"type": "string", "minLength": 1},
     "argv": array(S, 1, 1024),
     "cwd": S,
-    "shell": enum("powershell", "cmd", "wsl"),
+    "shell": enum("powershell", "cmd", "wsl", "sh", "bash"),
     "wsl_distribution": S,
     "wsl_cwd": S,
     "env": {"type": "object", "additionalProperties": {"type": ["string", "null"]}},
@@ -196,7 +198,7 @@ TOOL_SPECS = {
     "task_manage": definition(
         "持久化可恢复任务状态：目标、步骤、检查点、阻塞原因、恢复、最终复核和完成条件。",
         {
-            "action": enum("create", "list", "get", "checkpoint", "block", "resume", "final_review", "complete"),
+            "action": enum("create", "list", "get", "checkpoint", "block", "resume", "final_review", "complete", "recover", "resolve_execution"),
             "title": {"type": "string", "minLength": 1, "maxLength": 2048},
             "goal": {"type": "string", "minLength": 1, "maxLength": 16384},
             "project": S,
@@ -216,6 +218,8 @@ TOOL_SPECS = {
             "verified": array(S, 0, 64),
             "risks": array(S, 0, 64),
             "missing_checks": array(S, 0, 64),
+            "execution_operation_id": S,
+            "execution_resolution": enum("verified_completed", "verified_failed"),
             "expected_revision": integer(1, 2147483647),
         },
         ["action"],
@@ -255,7 +259,7 @@ TOOL_SPECS = {
     ),
     "mcp_tool_call": definition(
         "调用已发现的独立 MCP 工具；先按缓存 schema 校验 arguments，再转发到目标 MCP。",
-        {"name": {"type": "string", "minLength": 3}, "arguments": {"type": "object", "additionalProperties": True}},
+        {"task_id": S, "step_id": S, "name": {"type": "string", "minLength": 3}, "arguments": {"type": "object", "additionalProperties": True}},
         ["name", "arguments"],
     ),
     "host_manage": definition(

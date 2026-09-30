@@ -1,0 +1,47 @@
+{
+  "baseline": "027bdafc0cd32f5d1a04c84a6711e8e039391d40",
+  "branch": "fix/durable-recovery-lifecycle",
+  "source_version": "0.2.2",
+  "python": "3.12.14 (main, Aug 25 2026, 14:00:49) [Clang 22.1.3 ]",
+  "acceptance": {
+    "passed": 45,
+    "failed": 0,
+    "skipped": 0
+  },
+  "full_runnable": {
+    "passed": 285,
+    "failed": 0,
+    "skipped": 60
+  },
+  "deselected": 20,
+  "baseline_failures": 39,
+  "candidate_original_failures": 39,
+  "introduced_failures": [],
+  "checks": {
+    "compileall": "PASS",
+    "pip_check": "PASS",
+    "diff_check": "PASS",
+    "wheel_metadata_and_source_match": "PASS"
+  },
+  "wheel_sha256": "5f192a4136874855542e09fcb13dcd8fcb689ea3dad90b8a269bde2944b2a423",
+  "unverified": [
+    "Windows official Runtime/PTY/files/Git",
+    "Windows CUA/Tabbit GUI",
+    "real verified CUA version/fingerprint",
+    "Windows DPAPI/named event/Job Object",
+    "macOS",
+    "SSH",
+    "Docker",
+    "GitHub Actions not run"
+  ],
+  "speed_setting": "No supported current-task Fast setting interface exposed",
+  "deployment": "No push/PR/merge/deploy; no user machine or auth/permission config changes",
+  "publication_blocker": "Baseline freeze_source_lkg.py hardcodes 0.2.0; parent decision required before LKG activation",
+  "raw_evidence_sha256": {
+    "baseline.log": "e37ff286971d5214303052b139db37f8ba58fbff39466e33fbe93e1ab364149b",
+    "baseline.xml": "090027c7fb35843e6286c081f83ebbdcc02221a1440cd1b0855c71d7307690f7",
+    "full.log": "3f70ffce95d1115f9c211af1fa79612819d00c3026bc235e85e0f8856cafee28",
+    "full.xml": "a12b0ba99b989b65a52d22feacf95082c418bc96db429a492bcc60687fd5570b"
+  },
+  "tracked_log_normalization": "Trailing whitespace only; original bytes retained in delivery/raw-evidence"
+}

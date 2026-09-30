@@ -4,6 +4,7 @@ import base64, ctypes, hashlib, json, os, pathlib, subprocess, tempfile, threadi
 from datetime import datetime, timezone
 from .errors import BridgeError
 
+CURRENT_TASK_EXECUTION = contextvars.ContextVar("task_execution", default=None)
 CURRENT_OPERATION = contextvars.ContextVar("current_operation", default=None)
 ELICITATION_FORWARDER = contextvars.ContextVar("elicitation_forwarder", default=None)
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0

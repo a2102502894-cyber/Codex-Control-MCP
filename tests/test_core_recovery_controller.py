@@ -12,6 +12,9 @@ import os
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+import pytest
+pytest.importorskip("msvcrt", reason="Windows controller OS lease tests")
+
 SPEC = importlib.util.spec_from_file_location(
     "core_recovery_controller", ROOT / "scripts/core_recovery_controller.py"
 )

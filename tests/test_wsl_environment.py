@@ -19,7 +19,7 @@ def test_proxy_environment_is_forwarded_to_wsl_without_changing_parent(tmp_path,
 
 
 def test_empty_proxy_is_not_added_and_existing_sharing_flags_are_preserved(tmp_path, monkeypatch):
-    for name in ('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy'):
+    for name in ('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy', 'NO_PROXY', 'no_proxy'):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv('WSLENV', 'KEEP/p:NO_PROXY/up')
     env, _ = build_environment(Config(home=tmp_path, cwd=str(tmp_path), inherit_system_proxy=False))

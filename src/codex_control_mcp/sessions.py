@@ -1,6 +1,6 @@
 from __future__ import annotations
-import base64, codecs, collections, copy, dataclasses, json, threading, uuid
-from .common import CURRENT_OPERATION, atomic_json, utc_now
+import base64, codecs, collections, copy, dataclasses, json, pathlib, sqlite3, threading, uuid
+from .common import CURRENT_OPERATION, utc_now
 from .errors import BridgeError
 
 
@@ -27,6 +27,28 @@ class Session:
     finished: threading.Event = dataclasses.field(default_factory=threading.Event)
     origin_operation_id: str | None = dataclasses.field(default_factory=CURRENT_OPERATION.get)
 
+    persist: object = None
+    archived: bool = False
+    output_availability: str = "available"
+    persistence_error: str | None = None
+
+    def _persist(self):
+        if self.persist:
+            try:
+                self.persist(self)
+                self.persistence_error = None
+            except Exception as exc:
+                # Preserve live output/real result; durable last snapshot remains
+                # consistent, and will reopen as lost if it was not finalized.
+                self.persistence_error = type(exc).__name__
+
+    def _bound(self):
+        while self.events and (self.bytes_cached > self.capacity or len(self.events) > 8192):
+            removed = self.events.popleft()["size"]
+            self.bytes_cached -= removed
+            self.dropped_output_bytes += removed
+            self.truncated = True
+
     def append(self, params):
         raw = base64.b64decode(params.get("deltaBase64", ""), validate=True)
         if len(raw) > 1024:
@@ -47,6 +69,7 @@ class Session:
             if params.get("capReached"):
                 with self.lock:
                     self.truncated = True
+                    self._persist()
             return
         stream = params.get("stream", "stdout")
         with self.lock:
@@ -72,17 +95,12 @@ class Session:
             self.bytes_cached += len(raw)
             # A byte cap alone permits millions of one-byte Python objects.
             # Bound both raw bytes and per-event allocation overhead.
-            while self.events and (
-                self.bytes_cached > self.capacity or len(self.events) > 8192
-            ):
-                removed = self.events.popleft()["size"]
-                self.bytes_cached -= removed
-                self.dropped_output_bytes += removed
-                self.truncated = True
+            self._bound()
             if params.get("capReached"):
                 self.truncated = True
             if self.state == "starting":
                 self.state = "running"
+            self._persist()
 
     def finish(self, future):
         with self.lock:
@@ -112,6 +130,10 @@ class Session:
                         }
                     )
                     self.next_cursor += 1
+            if self.state == "lost":
+                self.exit_code = None
+            self._bound()
+            self._persist()
             self.finished.set()
 
     def metadata(self):
@@ -126,15 +148,18 @@ class Session:
                 "created_at": self.created_at,
                 "state": self.state,
                 "exit_code": self.exit_code,
-                "stdin_supported": True,
+                "stdin_supported": not self.archived,
                 "pty": self.tty,
-                "terminate_supported": True,
+                "terminate_supported": not self.archived,
                 "next_cursor": self.next_cursor,
                 "output_truncated": self.truncated,
                 "total_output_bytes": self.total_output_bytes,
                 "dropped_output_bytes": self.dropped_output_bytes,
                 "event_limit": 8192,
-                "reconnectable": self.state in ("starting", "running"),
+                "reconnectable": not self.archived and self.state in ("starting", "running"),
+                "archived": self.archived,
+                "output_availability": self.output_availability,
+                "persistence_error": self.persistence_error,
                 "reconnect_scope": "same_bridge_and_official_connection_only",
                 "restartable": False,
                 "error": copy.deepcopy(self.error),
@@ -172,88 +197,136 @@ class Session:
 
 
 class SessionStore:
+    """Bounded per-session snapshots. Lock order: session -> db; never db -> session."""
+
     def __init__(self, path, capacity, max_sessions):
-        self.path, self.capacity, self.max_sessions = path, capacity, max_sessions
+        self.path, self.capacity, self.max_sessions = pathlib.Path(path), capacity, max_sessions
         self.lock = threading.RLock()
+        self.db_lock = threading.RLock()
         self.items = {}
-        self.previous = []
-        if path.exists():
+        self.previous = []  # compatibility: history is now readable via get()
+        self.closed = False
+        self.db = sqlite3.connect(self.path.with_suffix(".sqlite3"), check_same_thread=False)
+        self.db.execute("PRAGMA synchronous=FULL")
+        self.db.execute("PRAGMA foreign_keys=ON")
+        with self.db:
+            self.db.execute("CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,doc TEXT NOT NULL)")
+            self.db.execute("CREATE TABLE IF NOT EXISTS session_events(session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,cursor INTEGER NOT NULL,event TEXT NOT NULL,PRIMARY KEY(session_id,cursor))")
+            self.db.execute("CREATE TABLE IF NOT EXISTS migrations(name TEXT PRIMARY KEY)")
+            self.db.execute("BEGIN IMMEDIATE")
+            if not self.db.execute("SELECT 1 FROM migrations WHERE name='json-v1'").fetchone():
+                if self.path.exists():
+                    data = json.loads(self.path.read_text("utf-8"))
+                    if not isinstance(data, list):
+                        raise BridgeError("session_state_corrupt", "Legacy session history is not a list.")
+                    for meta in data[-max_sessions:]:
+                        if isinstance(meta, dict) and isinstance(meta.get("session_id"), str):
+                            doc = {"version": 1, "metadata": meta, "events": [], "output_availability": "unavailable"}
+                            self.db.execute("INSERT OR IGNORE INTO sessions VALUES(?,?)", (meta["session_id"], json.dumps(doc)))
+                self.db.execute("INSERT INTO migrations VALUES('json-v1')")
+        for sid, raw in self.db.execute("SELECT id,doc FROM sessions").fetchall():
             try:
-                data = json.loads(path.read_text("utf-8"))
-                if not isinstance(data, list):
-                    raise ValueError("Session history is not a list")
-                records = {
-                    x["session_id"]: x
-                    for x in data
-                    if isinstance(x, dict) and isinstance(x.get("session_id"), str)
-                }
-                recent = sorted(
-                    records.values(), key=lambda x: str(x.get("created_at", ""))
-                )[-max_sessions:]
-                for item in recent:
-                    if item.get("state") in ("starting", "running"):
-                        item["state"] = "lost"
-                        item["reconnectable"] = False
-                        item["error"] = {
-                            "code": "session_lost",
-                            "message": "Bridge restarted; original session cannot be reattached.",
-                        }
-                    self.previous.append(item)
-            except (OSError, ValueError, TypeError):
-                pass
+                doc = json.loads(raw)
+                if doc["version"] not in (1, 2):
+                    raise ValueError("Unsupported session version")
+                meta = doc["metadata"]
+                session = Session(sid, meta["runtime_generation"], meta["cwd"], capacity, meta.get("pty", False))
+                for field, key in (("created_at", "created_at"), ("state", "state"), ("exit_code", "exit_code"), ("error", "error"), ("next_cursor", "next_cursor"), ("truncated", "output_truncated"), ("total_output_bytes", "total_output_bytes"), ("dropped_output_bytes", "dropped_output_bytes"), ("origin_operation_id", "origin_operation_id")):
+                    if key in meta:
+                        setattr(session, field, meta[key])
+                stored_events = doc.get("events", []) if doc["version"] == 1 else [json.loads(row[0]) for row in self.db.execute("SELECT event FROM session_events WHERE session_id=? ORDER BY cursor", (sid,)).fetchall()]
+                session.events = collections.deque(stored_events)
+                session.bytes_cached = sum(x["size"] for x in session.events)
+                session.archived = True
+                session.output_availability = doc.get("output_availability", "available")
+                if session.state in ("starting", "running"):
+                    session.state, session.exit_code = "lost", None
+                    session.error = {"code": "session_lost", "message": "Bridge restarted; original process is not owned or reattached."}
+                    # Persist decoder tail so incomplete UTF-8 is explicitly visible.
+                    for stream, encoded in doc.get("decoder_tails", {}).items():
+                        tail = base64.b64decode(encoded).decode("utf-8", "replace")
+                        if tail:
+                            session.events.append({"cursor": session.next_cursor, "stream": stream, "text": tail, "data_base64": "", "size": 0})
+                            session.next_cursor += 1
+                session._bound()
+                session.finished.set()
+                session.persist = self._save_session
+                self.items[sid] = session
+                self._save_session(session)
+            except (ValueError, KeyError, TypeError) as exc:
+                raise BridgeError("session_state_corrupt", "Stored session snapshot is invalid; no command is replayed.") from exc
+
+    def _save_session(self, session):
+        # Caller holds session.lock or session is not published yet.
+        doc = {"version": 2, "metadata": session.metadata(),
+               "output_availability": session.output_availability,
+               "decoder_tails": {k: base64.b64encode(v.getstate()[0]).decode() for k, v in session.decoders.items()}}
+        raw = json.dumps(doc, ensure_ascii=False, separators=(",", ":"))
+        with self.db_lock:
+            if self.closed:
+                raise BridgeError("session_store_closed", "Session persistence has closed.")
+            with self.db:
+                previous = self.db.execute("SELECT doc FROM sessions WHERE id=?", (session.id,)).fetchone()
+                previous_doc = json.loads(previous[0]) if previous else {}
+                persisted_cursor = previous_doc.get("metadata", {}).get("next_cursor", 0) if previous_doc.get("version") == 2 else 0
+                self.db.execute("INSERT INTO sessions VALUES(?,?) ON CONFLICT(id) DO UPDATE SET doc=excluded.doc", (session.id, raw))
+                self.db.executemany("INSERT OR REPLACE INTO session_events VALUES(?,?,?)", ((session.id, event["cursor"], json.dumps(event, ensure_ascii=False, separators=(",", ":"))) for event in session.events if event["cursor"] >= persisted_cursor))
+                oldest = session.events[0]["cursor"] if session.events else session.next_cursor
+                self.db.execute("DELETE FROM session_events WHERE session_id=? AND cursor<?", (session.id, oldest))
 
     def create(self, generation, cwd, tty=False):
         with self.lock:
-            if (
-                sum(s.state in ("starting", "running") for s in self.items.values())
-                >= self.max_sessions
-            ):
+            if sum(s.state in ("starting", "running") for s in self.items.values()) >= self.max_sessions:
                 raise BridgeError("resource_limit", "Concurrent session limit reached.")
-            old = [
-                k
-                for k, s in self.items.items()
-                if s.state not in ("starting", "running")
-            ]
-            for k in old[: -self.max_sessions]:
-                self.items.pop(k, None)
-            s = Session("s_" + uuid.uuid4().hex, generation, cwd, self.capacity, tty)
-            self.items[s.id] = s
-            self.save()
-            return s
+            old = sorted((s for s in self.items.values() if s.state not in ("starting", "running") and s.finished.is_set()), key=lambda s: s.created_at)
+            for session in old[:max(0, len(self.items) - self.max_sessions + 1)]:
+                with self.db_lock, self.db:
+                    self.db.execute("DELETE FROM sessions WHERE id=?", (session.id,))
+                self.items.pop(session.id, None)
+            session = Session("s_" + uuid.uuid4().hex, generation, cwd, self.capacity, tty)
+            session.persist = self._save_session
+            self._save_session(session)  # must succeed before backend dispatch
+            self.items[session.id] = session
+            return session
 
     def get(self, id, generation=None):
         with self.lock:
-            s = self.items.get(id)
-        if not s:
-            raise BridgeError(
-                "session_lost", "No session owned by this bridge has that ID."
-            )
-        if generation and s.generation != generation:
-            raise BridgeError(
-                "session_lost", "Session belongs to a previous official connection."
-            )
-        return s
+            session = self.items.get(id)
+        if not session:
+            raise BridgeError("session_lost", "No session owned by this bridge has that ID.")
+        if generation and (session.archived or session.generation != generation):
+            raise BridgeError("session_lost", "Session belongs to a previous official connection.")
+        return session
 
     def notify(self, message):
         if message.get("method") != "command/exec/outputDelta":
             return
         params = message.get("params", {})
-        s = self.items.get(params.get("processId"))
-        if s:
-            s.append(params)
+        with self.lock:
+            session = self.items.get(params.get("processId"))
+        if session and not session.archived:
+            session.append(params)
 
     def save(self):
         with self.lock:
-            records = {x["session_id"]: x for x in self.previous}
-            records.update({s.id: s.metadata() for s in self.items.values()})
-            # The most recent records must be at the end across every restart.
-            ordered = sorted(
-                records.values(), key=lambda x: str(x.get("created_at", ""))
-            )
-            atomic_json(self.path, ordered)
+            sessions = list(self.items.values())
+        for session in sessions:
+            with session.lock:
+                self._save_session(session)
 
     def list(self):
         with self.lock:
-            return [s.metadata() for s in self.items.values()] + copy.deepcopy(
-                self.previous
-            )
+            sessions = list(self.items.values())
+        return [session.metadata() for session in sessions]
+
+    def close(self):
+        with self.db_lock:
+            if self.closed:
+                return
+        try:
+            self.save()
+        finally:
+            with self.db_lock:
+                if not self.closed:
+                    self.closed = True
+                    self.db.close()

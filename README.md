@@ -1,6 +1,48 @@
-﻿# Codex-Control-MCP 0.2.0
+# Codex-Control-MCP 0.2.2
 
 Codex-Control-MCP 是本机/远端执行基础设施 MCP。它通过已安装的官方 Codex Runtime 提供 Shell、文件、Git、长任务会话、Browser、Computer Use，以及 0.2.0 新增的可恢复任务、多主机路由、动态 MCP 和 Skill 生命周期管理。
+
+
+## 0.2.2 持久化与恢复候选（尚未发布部署）
+
+- 幂等调用的版本化 JSON receipt 与 complete 状态在一个 SQLite 事务提交；重启、缓存淘汰后可读回独立副本。started、旧版无 receipt、损坏或未知版本结果均拒绝自动重执行。第一次真实响应不会被晚期落盘失败替换。
+- 会话输出增量写入 `state/sessions.sqlite3`，与最终退出码/状态原子提交，受字节与事件数量限制。重启可读已存输出；原 running 会话成为 lost、退出码为 null、不可重连或控制，不接管原进程。旧 `sessions.json` 一次性导入，原文件保留；未记录的输出标记 unavailable。
+- `exec_command`、`session_start`、`host_exec`、`mcp_tool_call` 可传 `task_id/step_id`。关联在派发前落盘；`task_manage(action="recover")` 是只读视图，不执行命令。unknown/lost 执行阻止 resume/complete；人工核验后用 `resolve_execution` 提交 operation ID、核验状态、summary 和 evidence。检查点和新执行使旧 final_review 失效。
+- Dynamic MCP 每个服务使用独立 owner task 和有界串行队列，在专属事件循环复用 stdio/HTTP 会话；完整分页成功后才替换 schema。超时或断线发生在调用后时返回结果未知，不自动重试。update/disable/remove 使旧 generation 失效，Bridge.close 关闭进程和线程。
+- 官方 CUA 插件要求明确的已核验版本与 manifest SHA-256，按配置匹配后进行只读契约探测，拒绝未知新版。仓库没有可作为真实 Windows 验收依据的指纹；本次仅验证受控 fixture。Tabbit 后端和既有应用访问授权策略保持原样。
+
+| 能力 | Linux 云端本次证据 | Windows / macOS 本次证据 |
+| --- | --- | --- |
+| SQLite 幂等、归档输出、任务 CAS/recover | 单测与故障/竞争 fixture 通过 | 未实机验证；CI 配置待实际运行 |
+| Dynamic MCP stdio / HTTP | 真实受控 stdio 与 loopback HTTP 的状态复用测试通过 | 未实机验证 |
+| POSIX Shell/文件辅助操作 | 实际 sh、Unicode、结构化 argv、不覆盖移动通过；需 python3 | Windows 分支保留；macOS 未实机验证 |
+| 官方 Codex Shell/PTY/fs/Git | 没有真实官方 Runtime 全链路验收 | 未验证 |
+| 官方 CUA / Tabbit GUI | 契约 fixture；无真实 GUI 验收 | 未验证 |
+| OAuth DPAPI / named event / Job Object | 非 Windows 明确跳过 | 原测试保留，未在本次实机验证 |
+| SSH / Docker 远端路由 | 仅已有路由 fixture | 未实机验证 |
+
+普通执行路径不新增模型 RPC 回合；这不等于官方账单或订阅额度“零扣额”，账单归属仍需产品侧证据。第三方 MCP 自身的模型调用/计费不由本桥承诺。
+
+可复现的云端检查（Python 3.11+）：
+
+```bash
+python -m venv .venv
+.venv/bin/python -m pip install -e '.[dev]'
+.venv/bin/python -m compileall -q src
+.venv/bin/python -m pytest tests -q -m 'not integration' --tb=short -o faulthandler_timeout=60
+```
+
+Windows 使用 `.venv\Scripts\python.exe`。标记 integration 的测试需明确具备官方 Codex；Windows OS/DPAPI 测试在非 Windows 环境标记跳过，不用明文或 mock 加密代替。CI 仅运行上述可运行范围，没有新建凭据。完整修改合同、命令日志、基线失败对照和回退方式见 [持久化与恢复实施记录](docs/durable-recovery-review.md)。
+
+官方 CUA 的选择配置需要由拥有实机验证证据的操作者填写（本次没有写入任何运行配置）：
+
+```toml
+[cua_compatibility]
+version = "已核验的插件目录版本"
+manifest_sha256 = "已核验的 .mcp.json 原始字节 SHA-256"
+```
+
+POSIX 文件移动使用拒绝覆盖的 link 后 unlink；只支持可硬链接的同一文件系统，跨文件系统失败时保留源文件。断电/失败可能留下源与目标同时存在，应核验后手动处理，不自动重试。状态数据库回退前必须保存当前库，不能清空幂等 started 行或恢复过旧库后重复命令。
 
 ## 一句话定位
 
@@ -61,7 +103,7 @@ Codex-Control-MCP
 
 ### Recoverable Task Runtime
 
-`task_manage` 支持：`create / list / get / checkpoint / block / resume / final_review / complete`。
+`task_manage` 支持：`create / list / get / checkpoint / block / resume / final_review / complete / recover / resolve_execution`。
 
 任务保存在 `%USERPROFILE%\.codex-control-mcp\state\recoverable-tasks.sqlite3`，使用 SQLite WAL。任务记录 goal、steps、completion conditions、checkpoint、blocker、revision、event history 和 final review。只有全部步骤完成且 final review 为 pass 后才能 complete。
 
@@ -88,6 +130,10 @@ Codex-Control-MCP
 ### Skill 生命周期
 
 `skill_package` 支持 `validate / install / activate / rollback / uninstall / list / inspect`，支持本地目录、ZIP 和 Git URL，提供 SHA-256 校验、stable/development/canary/pinned 通道、版本激活与回滚。
+
+## 历史部署与生产记录（不代表 0.2.2 已部署）
+
+以下保留原有部署/LKG 记录，版本和生产状态仅对应此前验收。本次 0.2.2 的证据以本页候选能力矩阵和实施记录为准。
 
 ## 源码生产方式
 

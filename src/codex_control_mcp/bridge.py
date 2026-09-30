@@ -21,6 +21,7 @@ from .diagnostics import (CallTrace, CURRENT_TRACE, INCOMING_OPERATION,
                           current_rpc_evidence, error_origin, health_observation)
 from .idempotency import Idempotency
 from .task_runtime import RecoverableTaskStore
+from .common import CURRENT_TASK_EXECUTION
 from .dynamic_mcp import DynamicMCPManager
 from .skill_manager import SkillManager
 from .host_runtime import HostManager
@@ -83,7 +84,9 @@ class Bridge:
         self.gui_idle_seconds = 120
         self.browser = None
         self.tasks = RecoverableTaskStore(cfg.home / "state/recoverable-tasks.sqlite3")
+        self.tasks.session_reader = lambda sid: self.sessions.get(sid).read()
         self.dynamic_mcp = DynamicMCPManager(cfg)
+        self.dynamic_mcp.before_dispatch = lambda operation, generation: self.tasks.link_execution(operation, runtime_generation=generation)
         self.skills = SkillManager(cfg)
         self.hosts = HostManager(self, self.dynamic_mcp)
         self.runtime = None
@@ -176,6 +179,9 @@ class Bridge:
         with self.ready_lock:
             self.ensure_ready()
             rpc = self.rpc
+            association = CURRENT_TASK_EXECUTION.get()
+            if association:
+                self.tasks.link_execution(association, runtime_generation=rpc.generation)
             future = rpc.begin(method, params)
         start = time.perf_counter()
         try:
@@ -216,7 +222,9 @@ class Bridge:
             raise BridgeError(
                 "invalid_arguments", "command must be nonempty text without NUL."
             )
-        shell = a.get("shell", "powershell")
+        shell = a.get("shell", "powershell" if os.name == "nt" else "sh")
+        if shell in ("sh", "bash"):
+            return ["/bin/sh" if shell == "sh" else "bash", "-c", command]
         if shell == "powershell":
             return ps_argv(
                 "[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);$OutputEncoding=[Console]::OutputEncoding;"
@@ -243,7 +251,7 @@ class Bridge:
                 command,
             ]
         raise BridgeError(
-            "invalid_arguments", "Supported shells: powershell, cmd, wsl."
+            "invalid_arguments", "Supported shells: powershell, cmd, wsl, sh, bash."
         )
 
     def _command_environment(self, args):
@@ -305,14 +313,18 @@ class Bridge:
             )
         return data
 
+    def _file_size_argv(self, path):
+        if os.name != "nt":
+            return ["python3", "-c", "import os,sys; p=sys.argv[1]; assert os.path.isfile(p), 'Expected a file'; print(os.stat(p).st_size)", path]
+        return ps_argv("$ErrorActionPreference='Stop';$f=Get-Item -LiteralPath " + ps_quote(path) + ";if($f.PSIsContainer){throw 'Expected a file'};[Console]::Write($f.Length)")
+
+    def _move_file_argv(self, source, destination):
+        if os.name != "nt":
+            return ["python3", "-c", "import os,sys; os.link(sys.argv[1],sys.argv[2],follow_symlinks=False); os.unlink(sys.argv[1])", source, destination]
+        return ps_argv("$ErrorActionPreference='Stop';[IO.File]::Move(" + ps_quote(source) + "," + ps_quote(destination) + ")")
+
     def _read_bytes(self, path):
-        result = self._command(
-            ps_argv(
-                "$ErrorActionPreference='Stop';$f=Get-Item -LiteralPath "
-                + ps_quote(path)
-                + ";if($f.PSIsContainer){throw 'Expected a file'};[Console]::Write($f.Length)"
-            )
-        )
+        result = self._command(self._file_size_argv(path))
         self._require_success(result)
         try:
             size = int(result["stdout"].strip())
@@ -410,12 +422,16 @@ class Bridge:
             s = self.sessions.create(self.rpc.generation, cwd, a.get("tty", False))
             params["processId"] = s.id
             try:
+                association = CURRENT_TASK_EXECUTION.get()
+                if association:
+                    self.tasks.link_execution(association, session_id=s.id, runtime_generation=s.generation, cursor=s.next_cursor)
                 s.future = self.rpc.begin("command/exec", params)
             except BaseException as exc:
                 s.state = "lost" if isinstance(exc, BridgeError) and exc.code == "execution_state_unknown" else "failed"
                 s.error = exc.as_dict() if isinstance(exc, BridgeError) else {"code": "execution_state_unknown", "message": "Session startup failed; no replay performed."}
-                s.finished.set()
-                self.sessions.save()
+                with s.lock:
+                    s._persist()
+                    s.finished.set()
                 raise
         try:
             def completed(f):
@@ -423,8 +439,15 @@ class Bridge:
                 if not s.error and self.rpc and self.rpc.generation == s.generation:
                     self.verified["command/exec"] = {"at": utc_now(), "result": "PASS",
                                                      "generation": s.generation}
-                self.sessions.save()
+                association = linked_operation
+                if association:
+                    try:
+                        self.tasks.link_execution(association, state="unknown" if s.state == "lost" else "completed" if s.state == "exited" else "failed", cursor=s.next_cursor)
+                    except Exception:
+                        # Existing started association remains a recovery barrier.
+                        s.persistence_error = "task_association_persistence_failed"
 
+            linked_operation = CURRENT_TASK_EXECUTION.get()
             s.future.add_done_callback(completed)
         except BridgeError as e:
             s.state = "failed"
@@ -586,6 +609,9 @@ class Bridge:
             s = self.sessions.get(a["session_id"])
             return s.read(a.get("cursor", 0), a.get("max_bytes", 262144))
         if tool in ("session_write", "session_kill", "session_resize"):
+            s = self.sessions.get(a["session_id"])
+            if s.archived:
+                raise BridgeError("session_lost", "Archived sessions cannot be controlled.")
             self.ensure_ready()
             s = self.sessions.get(a["session_id"], self.rpc.generation)
             if s.state not in ("starting", "running"):
@@ -684,14 +710,7 @@ class Bridge:
                     "fs/writeFile",
                     {"path": stage, "dataBase64": base64.b64encode(raw).decode()},
                 )
-                script = (
-                    "$ErrorActionPreference='Stop';[IO.File]::Move("
-                    + ps_quote(stage)
-                    + ","
-                    + ps_quote(path)
-                    + ")"
-                )
-                self._require_success(self._command(ps_argv(script)))
+                self._require_success(self._command(self._move_file_argv(stage, path)))
                 renamed = True
                 if self._read_bytes(path) != raw:
                     raise BridgeError(
@@ -712,7 +731,7 @@ class Bridge:
                 "bytes": len(raw),
                 "sha256": digest(raw),
                 "atomic_create_new": True,
-                "backend": "codex_app_server.fs.writeFile -> Windows.File.Move(no overwrite)",
+                "backend": "codex_app_server.fs.writeFile -> no_overwrite_move",
             }
         if tool == "file_delete":
             path = absolute_path(a["path"], self.cfg.cwd)
@@ -733,23 +752,14 @@ class Bridge:
         if tool == "file_move":
             src = absolute_path(a["source"], self.cfg.cwd)
             dst = absolute_path(a["destination"], self.cfg.cwd)
-            self._require_success(
-                self._command(
-                    ps_argv(
-                        "$ErrorActionPreference='Stop';[IO.File]::Move("
-                        + ps_quote(src)
-                        + ","
-                        + ps_quote(dst)
-                        + ")"
-                    )
-                )
-            )
+            self._require_success(self._command(self._move_file_argv(src, dst)))
             return {
                 "source": src,
                 "destination": dst,
                 "overwrite": False,
                 "atomicity": "not_guaranteed_across_volumes",
-                "backend": "codex_app_server.command_exec -> Windows.File.Move",
+                "backend": "codex_app_server.command_exec -> no_overwrite_move",
+                "move_implementation": "Windows.File.Move" if os.name == "nt" else "POSIX.link_then_unlink",
             }
         if tool == "file_patch":
             cwd = self._cwd(a.get("cwd"))
@@ -976,9 +986,7 @@ class Bridge:
         child_admin = None
         if active:
             out = self._command(
-                ps_argv(
-                    "Write-Output 'CODEX_CONTROL_MCP_OK';([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)"
-                )
+                ps_argv("Write-Output 'CODEX_CONTROL_MCP_OK';([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)") if os.name == "nt" else ["python3", "-c", "import os; print('CODEX_CONTROL_MCP_OK'); print(os.geteuid()==0)"]
             )
             checks["shell"] = (
                 "PASS"
@@ -989,9 +997,7 @@ class Bridge:
             self._rpc("fs/readDirectory", {"path": self.cfg.cwd})
             checks["files"] = "PASS"
             child = self._command(
-                ps_argv(
-                    "$n=@('HTTP_PROXY','HTTPS_PROXY','ALL_PROXY','NO_PROXY');$r=@{};foreach($k in $n){$r[$k]=!![Environment]::GetEnvironmentVariable($k)};$r|ConvertTo-Json -Compress"
-                )
+                ps_argv("$n=@('HTTP_PROXY','HTTPS_PROXY','ALL_PROXY','NO_PROXY');$r=@{};foreach($k in $n){$r[$k]=!![Environment]::GetEnvironmentVariable($k)};$r|ConvertTo-Json -Compress") if os.name == "nt" else ["python3", "-c", "import os,json; print(json.dumps({k:bool(os.environ.get(k)) for k in ('HTTP_PROXY','HTTPS_PROXY','ALL_PROXY','NO_PROXY')}))"]
             )
             try:
                 presence = json.loads(child["stdout"])
@@ -1086,12 +1092,15 @@ class Bridge:
         key = a.pop("idempotency_key", None)
         risk = (
             "read" if tool in READ_TOOLS
+            or (tool == "task_manage" and a.get("action") in ("list", "get", "recover"))
             or (tool == "git_branch" and a.get("action", "list") == "list")
             else "dangerous" if tool in (
                 "exec_command", "session_start", "file_delete", "session_kill",
                 "host_exec", "mcp_tool_call") else "write"
         )
         reserved = False
+        linked_execution = False
+        task_token = CURRENT_TASK_EXECUTION.set(None)
         failure_origin = None
         replayed_operation_id = None
         try:
@@ -1114,6 +1123,11 @@ class Bridge:
             else:
                 self.audit.emit("tool_start", tool=tool, risk_level=risk, param_keys=sorted(a))
                 trace.mark("bridge_dispatch")
+                if tool != "task_manage" and (a.get("task_id") or a.get("step_id")):
+                    task_id, step_id = a.pop("task_id", None), a.pop("step_id", None)
+                    self.tasks.begin_execution(task_id, step_id, operation_id, tool)
+                    linked_execution = True
+                    CURRENT_TASK_EXECUTION.set(operation_id)
                 if tool in FILE_WRITES:
                     with self.write_lock:
                         data = self._do(tool, a)
@@ -1157,6 +1171,7 @@ class Bridge:
         finally:
             backend = BACKEND_TIME.get()
             BACKEND_TIME.reset(token)
+            CURRENT_TASK_EXECUTION.reset(task_token)
             CURRENT_OPERATION.reset(operation_token)
             CURRENT_TRACE.reset(trace_token)
             INCOMING_OPERATION.reset(incoming_token)
@@ -1198,6 +1213,15 @@ class Bridge:
                 "status": "degraded", "event": "tool_finish",
                 "error_type": type(exc).__name__, "operation_result_preserved": True,
             }
+        if linked_execution:
+            result = out.get("result") or {}
+            if isinstance(result.get("result"), dict):
+                result = result["result"]
+            state = "running" if result.get("state") in ("running", "starting") else "unknown" if (out.get("error") or {}).get("code") in ("execution_state_unknown", "internal_error") or result.get("state") == "lost" else "completed" if out["ok"] else "failed"
+            try:
+                self.tasks.link_execution(operation_id, state=state)
+            except Exception as exc:
+                out["diagnostics"]["task_persistence"] = {"status": "failed", "error_type": type(exc).__name__, "operation_result_preserved": True}
         if reserved:
             try:
                 self.idempotency.finish(key, out)
@@ -1218,7 +1242,7 @@ class Bridge:
         try:
             cleanups = ([self.browser.close] if self.browser else []) + [self._close_computer]
             cleanups += ([self.rpc.close] if self.rpc else [])
-            cleanups += [self.sessions.save, self.tasks.close, self.idempotency.close]
+            cleanups += [self.dynamic_mcp.close, self.sessions.close, self.tasks.close, self.idempotency.close]
             for cleanup in cleanups:
                 try:
                     cleanup()

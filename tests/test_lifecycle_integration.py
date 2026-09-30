@@ -11,6 +11,7 @@ from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from codex_control_mcp.auth import owner_token
 from codex_control_mcp.config import Config, DEFAULT_CONFIG
+from codex_control_mcp.tools import TOOL_SPECS
 
 
 def test_actual_http_service_graceful_stop(tmp_path):
@@ -51,7 +52,7 @@ def test_actual_http_service_graceful_stop(tmp_path):
                 async with ClientSession(r, w) as session:
                     await session.initialize()
                     tools = await session.list_tools()
-                    assert len(tools.tools) == 33
+                    assert len(tools.tools) == len(TOOL_SPECS)
                     execution = await session.call_tool('exec_command', {'command': "Write-Output 'LIFECYCLE_OFFICIAL_OK'"})
                     assert not execution.isError
                     assert execution.structuredContent['result']['stdout'].strip() == 'LIFECYCLE_OFFICIAL_OK'
