@@ -10,6 +10,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 pytestmark = pytest.mark.skipif(os.name != "nt", reason="Windows test runtime required")
 
 
+@pytest.mark.integration
 def test_stdio_real_mcp(tmp_path):
     async def run():
         env = os.environ.copy()
@@ -84,6 +85,7 @@ def test_invalid_serve_startup_does_not_pollute_stdio(tmp_path):
     assert p.returncode != 0 and not p.stdout and b"invalid_config" in p.stderr
 
 
+@pytest.mark.integration
 def test_http_real_mcp_auth_origin_body_limits(tmp_path):
     token = secrets.token_urlsafe(40)
     env = os.environ.copy()

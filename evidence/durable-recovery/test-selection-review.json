@@ -5,9 +5,9 @@
     "failed": 39
   },
   "final_counts": {
-    "passed": 312,
+    "passed": 324,
     "failed": 0,
-    "skipped": 60
+    "skipped": 54
   },
   "old_failures_outcomes": {
     "skipped": 36,
@@ -284,7 +284,7 @@
     "skipped": 60,
     "passed": 285
   },
-  "final_deselected": 20,
+  "final_deselected": 25,
   "full_stack_accepted": false,
   "lkg_new_tests": {
     "passed": 27,
@@ -294,11 +294,30 @@
   "skip_accounting": {
     "baseline_existing": 22,
     "new_module_importorskip": 2,
-    "new_case_platform_skip": 36
+    "new_case_platform_skip": 36,
+    "scope": "Historical pre-CI-fix counts; see ci_fix_increment for current adjustment"
   },
   "deselection_accounting": {
     "existing_integration": 18,
-    "new_integration": 2
+    "new_integration": 2,
+    "ci_fix_new_integration": 5
   },
-  "ci_extra_exclusion": "Pre-existing -k excludes test_wsl_availability_is_reported_not_assumed; remote CI has not run."
+  "ci_extra_exclusion": "Pre-existing -k excludes WSL availability: ordinary Linux CI expected 324 pass/53 skip/26 deselect. First remote run failed on two controller stub signatures and five absent official Runtime cases; incremental CI pending.",
+  "previous_lkg_final_counts": {
+    "passed": 312,
+    "failed": 0,
+    "skipped": 60,
+    "deselected": 20
+  },
+  "ci_fix_increment": {
+    "new_integration_cases": 5,
+    "linux_skip_to_deselect": 5,
+    "linux_skip_to_pass": 1,
+    "new_portable_cases": 11,
+    "new_windows_controller_cases": 3,
+    "new_skip_markers": 0,
+    "removed_tests": 0,
+    "official_runtime_executed": false,
+    "controller_existing_signature_failures_fixed": 2
+  }
 }

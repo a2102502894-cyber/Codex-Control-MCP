@@ -10,6 +10,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+from unittest.mock import create_autospec
 
 ROOT = Path(__file__).resolve().parents[1]
 import pytest
@@ -86,8 +87,12 @@ def test_deterministic_formal_current_lkg_order(monkeypatch, tmp_path):
         return type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
 
     outcomes = iter([(False, "formal_bad"), (False, "current_bad"), (True, "ready")])
+    counts = []
+    def verify(candidate, pid, expected_tool_count=None):
+        counts.append(expected_tool_count)
+        return next(outcomes)
     monkeypatch.setattr(controller, "task_command", task_command)
-    monkeypatch.setattr(controller, "verify_service", lambda c, p: next(outcomes))
+    monkeypatch.setattr(controller, "verify_service", create_autospec(controller.verify_service, side_effect=verify))
     assert controller.run(path) == controller.EXIT_OK
     report = json.loads(Path(config["report"]).read_text("utf-8"))
     assert [item["name"] for item in report["attempts"]] == [
@@ -96,6 +101,7 @@ def test_deterministic_formal_current_lkg_order(monkeypatch, tmp_path):
         "lkg_direct",
     ]
     assert report["selected"] == "lkg_direct"
+    assert counts == [None, None, 47]
     assert [(v, t) for v, t in calls if v == "Start"] == [
         ("Start", "formal"),
         ("Start", "current"),
@@ -125,12 +131,48 @@ def test_old_fallback_keeps_its_own_version_contract(monkeypatch, tmp_path):
     monkeypatch.setattr(controller, 'task_command', lambda *args:
         type('Result', (), {'returncode': 0, 'stdout': '', 'stderr': ''})())
     versions = []
-    def verify(candidate, pid):
+    counts = []
+    def verify(candidate, pid, expected_tool_count=None):
         versions.append(candidate['expected_version'])
+        counts.append(expected_tool_count)
         return len(versions) == 3, 'fixture'
-    monkeypatch.setattr(controller, 'verify_service', verify)
+    monkeypatch.setattr(controller, 'verify_service', create_autospec(controller.verify_service, side_effect=verify))
     assert controller.run(path) == controller.EXIT_OK
     assert versions == ['0.2.1', '0.2.1', '0.2.0']
+    assert counts == [None, None, 47]
+
+
+def test_distinct_candidate_versions_and_counts_reach_verifier(monkeypatch, tmp_path):
+    path, config = make_config(tmp_path)
+    config['candidates'][0].update(expected_version='0.2.1', expected_tool_count=46)
+    config['candidates'][1].update(expected_version='0.2.2', expected_tool_count=48)
+    path.write_text(json.dumps(config), encoding='utf-8')
+    monkeypatch.setattr(controller, 'port_pid', lambda port: 0)
+    monkeypatch.setattr(controller, 'wait_port', lambda *args: 1234)
+    monkeypatch.setattr(controller, 'task_command', lambda *args:
+        type('Result', (), {'returncode': 0, 'stdout': '', 'stderr': ''})())
+    seen = []
+    def verify(candidate, pid, expected_tool_count=None):
+        seen.append((candidate['expected_version'], expected_tool_count))
+        return len(seen) == 3, 'fixture'
+    monkeypatch.setattr(controller, 'verify_service', create_autospec(controller.verify_service, side_effect=verify))
+    assert controller.run(path) == controller.EXIT_OK
+    assert seen == [('0.2.1', 46), ('0.2.2', 48), ('0.2.0', 47)]
+
+
+@pytest.mark.parametrize('explicit', [None, 13])
+def test_real_verifier_forwards_optional_count_without_changing_version(monkeypatch, tmp_path, explicit):
+    home = tmp_path / 'home'
+    (home / 'state').mkdir(parents=True)
+    (home / 'state/service.json').write_text(json.dumps({'pid': 1234, 'version': '0.2.2'}))
+    config = {'home': str(home), 'expected_version': '0.2.2', 'expected_tool_count': 47}
+    async def probe(candidate, expected_tool_count=None):
+        assert candidate == config and expected_tool_count == explicit
+        return {'version': candidate['expected_version'],
+                'tool_count': candidate['expected_tool_count'] if expected_tool_count is None else expected_tool_count}
+    monkeypatch.setattr(controller, 'authenticated_mcp_probe', probe)
+    healthy, proof = controller.verify_service(config, 1234, explicit)
+    assert healthy and proof == {'version': '0.2.2', 'tool_count': 47 if explicit is None else explicit}
 
 
 def test_healthy_old_fallback_is_not_restarted(monkeypatch, tmp_path):

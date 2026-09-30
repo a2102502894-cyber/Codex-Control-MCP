@@ -1,0 +1,60 @@
+name: Official Windows Runtime acceptance
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  runtime:
+    # Opt-in lab only. Never scheduled on push/PR or the user's desktop.
+    runs-on: [self-hosted, Windows, ccm-runtime-lab]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Isolated test dependencies
+        shell: pwsh
+        run: |
+          python -m venv .venv-runtime-acceptance
+          .\.venv-runtime-acceptance\Scripts\python.exe -m pip install -e ".[dev]"
+      - name: Require existing official Runtime
+        shell: pwsh
+        run: |
+          @'
+          import json, pathlib, tempfile
+          from codex_control_mcp.config import Config
+          from codex_control_mcp.discovery import Discovery
+          with tempfile.TemporaryDirectory() as temp:
+              runtime = Discovery(Config(home=pathlib.Path(temp), cwd=temp)).find()
+              print(json.dumps({'cli_version': runtime.cli_version, 'source': runtime.source,
+                                'fingerprint': runtime.file_fingerprint}))
+          '@ | .\.venv-runtime-acceptance\Scripts\python.exe -
+      - name: Five real Runtime cases
+        shell: pwsh
+        run: >-
+          .\.venv-runtime-acceptance\Scripts\python.exe -m pytest -q --tb=short
+          -m integration -o faulthandler_timeout=60 --junitxml=runtime-results.xml
+          tests/test_runtime_edges.py::test_refresh_defers_active_session_and_disconnect_is_lost
+          tests/test_runtime_edges.py::test_pty_resize_and_input
+          tests/test_runtime_edges.py::test_controlled_proxy_route_through_official_child
+          tests/test_transport.py::test_stdio_real_mcp
+          tests/test_transport.py::test_http_real_mcp_auth_origin_body_limits
+      - name: Require five executed cases
+        shell: pwsh
+        run: |
+          @'
+          import json, pathlib, xml.etree.ElementTree as E
+          cases = list(E.parse('runtime-results.xml').iter('testcase'))
+          assert len(cases) == 5
+          assert not any(c.find(k) is not None for c in cases for k in ('failure', 'error', 'skipped'))
+          pathlib.Path('runtime-scope.json').write_text(json.dumps({
+              'official_runtime_five_cases_passed': True,
+              'full_stack_accepted': False,
+              'unverified': ['CUA GUI', 'user Windows desktop', 'real LKG service activation']
+          }, indent=2), encoding='utf-8')
+          '@ | .\.venv-runtime-acceptance\Scripts\python.exe -
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: official-runtime-acceptance
+          path: |
+            runtime-results.xml
+            runtime-scope.json

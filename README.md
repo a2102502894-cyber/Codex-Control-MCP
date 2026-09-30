@@ -13,12 +13,12 @@ Codex-Control-MCP 是本机/远端执行基础设施 MCP。它通过已安装的
 
 | 能力 | Linux 云端本次证据 | Windows / macOS 本次证据 |
 | --- | --- | --- |
-| SQLite 幂等、归档输出、任务 CAS/recover | 单测与故障/竞争 fixture 通过 | 未实机验证；CI 配置待实际运行 |
+| SQLite 幂等、归档输出、任务 CAS/recover | 单测与故障/竞争 fixture 通过 | hosted Windows CI 已运行；本轮修复待增量 CI 核验；用户实机未验 |
 | Dynamic MCP stdio / HTTP | 真实受控 stdio 与 loopback HTTP 的状态复用测试通过 | 未实机验证 |
 | POSIX Shell/文件辅助操作 | 实际 sh、Unicode、结构化 argv、不覆盖移动通过；需 python3 | Windows 分支保留；macOS 未实机验证 |
 | 官方 Codex Shell/PTY/fs/Git | 没有真实官方 Runtime 全链路验收 | 未验证 |
 | 官方 CUA / Tabbit GUI | 契约 fixture；无真实 GUI 验收 | 未验证 |
-| OAuth DPAPI / named event / Job Object | 非 Windows 明确跳过 | 原测试保留，未在本次实机验证 |
+| OAuth DPAPI / named event / Job Object | 非 Windows 明确跳过 | hosted Windows 原测试已执行；用户实机未验 |
 | SSH / Docker 远端路由 | 仅已有路由 fixture | 未实机验证 |
 
 普通执行路径不新增模型 RPC 回合；这不等于官方账单或订阅额度“零扣额”，账单归属仍需产品侧证据。第三方 MCP 自身的模型调用/计费不由本桥承诺。
@@ -32,7 +32,7 @@ python -m venv .venv
 .venv/bin/python -m pytest tests -q -m 'not integration' --tb=short -o faulthandler_timeout=60
 ```
 
-Windows 使用 `.venv\Scripts\python.exe`。标记 integration 的测试需明确具备官方 Codex；Windows OS/DPAPI 测试在非 Windows 环境标记跳过，不用明文或 mock 加密代替。CI 仅运行上述可运行范围，没有新建凭据。完整修改合同、命令日志、基线失败对照和回退方式见 [持久化与恢复实施记录](docs/durable-recovery-review.md)。
+Windows 使用 `.venv\Scripts\python.exe`。标记 integration 的测试需明确具备官方 Codex；Windows OS/DPAPI 测试在非 Windows 环境标记跳过，不用明文或 mock 加密代替。CI 仅运行上述可运行范围，没有新建凭据。五项官方 Runtime 用例的前提、受控 fixture 边界及可执行的独立验收 job 见 [CI Runtime 分类](docs/ci-runtime-classification.md)。普通 CI 通过不代表这五项或 Windows 全栈通过；独立 job 本次未触发。完整修改合同、命令日志、基线失败对照和回退方式见 [持久化与恢复实施记录](docs/durable-recovery-review.md)。
 
 官方 CUA 的选择配置需要由拥有实机验证证据的操作者填写（本次没有写入任何运行配置）：
 

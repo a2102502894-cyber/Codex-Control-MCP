@@ -205,3 +205,28 @@ def test_passive_health_does_not_reuse_previous_runtime_generation():
     b = health_fixture()
     b.verified['command/exec']['generation'] = 'generation-old'
     assert b.health(active=False)['checks']['shell'] == 'NOT_TESTED'
+
+
+@pytest.mark.parametrize('case', ['success', 'nonzero', 'invalid'])
+def test_sdk_receipt_contract_with_controlled_backend(bridge, case):
+    # Actual MCP framing, controlled Bridge result; no official execution claim.
+    bridge._do = lambda *args: {'exit_code': 9 if case == 'nonzero' else 0, 'stdout': 'synthetic'}
+    server = make_server(bridge)
+    async def run():
+        async with create_client_server_memory_streams() as (cs, ss):
+            async with anyio.create_task_group() as group:
+                group.start_soon(server.run, *ss, server.create_initialization_options())
+                async with ClientSession(*cs) as client:
+                    await client.initialize()
+                    response = await client.call_tool('read_file' if case == 'invalid' else 'exec_command',
+                                                      {} if case == 'invalid' else {'argv': ['owned-fixture']})
+                group.cancel_scope.cancel()
+                return response
+    response = asyncio.run(run())
+    assert response.isError == (case != 'success')
+    out = response.structuredContent
+    assert out['ok'] == (case == 'success')
+    if case == 'nonzero':
+        assert out['result']['exit_code'] == 9
+    elif case == 'invalid':
+        assert out['error']['code'] == 'invalid_arguments'

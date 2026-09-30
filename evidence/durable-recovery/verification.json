@@ -9,11 +9,11 @@
     "skipped": 0
   },
   "full_runnable": {
-    "passed": 312,
+    "passed": 324,
     "failed": 0,
-    "skipped": 60
+    "skipped": 54
   },
-  "deselected": 20,
+  "deselected": 25,
   "baseline_failures": 39,
   "candidate_original_failures": 39,
   "introduced_failures": [],
@@ -28,17 +28,17 @@
     "Windows official Runtime/PTY/files/Git",
     "Windows CUA/Tabbit GUI",
     "real verified CUA version/fingerprint",
-    "Windows DPAPI/named event/Job Object",
     "macOS",
     "SSH",
     "Docker",
-    "GitHub Actions not run",
     "Windows PowerShell host/installer and real LKG activation",
     "Windows maintenance guard integration",
-    "Abrupt process death or power-loss activation recovery"
+    "Abrupt process death or power-loss activation recovery",
+    "Incremental hosted Windows CI pending upload; first run OS cases executed",
+    "Official Runtime five-case opt-in lab job not run"
   ],
   "speed_setting": "No supported current-task Fast setting interface exposed",
-  "deployment": "No push/PR/merge/deploy; no user machine or auth/permission config changes",
+  "deployment": "Authorized owner API branch upload; no PR/merge/deploy/user-machine/auth-permission changes",
   "publication_blocker": "Windows full-stack acceptance unavailable; real LKG activation prohibited. Fixed-version compatibility code implemented and fixture-tested only.",
   "raw_evidence_sha256": {
     "baseline.log": "e37ff286971d5214303052b139db37f8ba58fbff39466e33fbe93e1ab364149b",
@@ -63,5 +63,43 @@
     "pip_check": "PASS",
     "no_actual_activation": true,
     "selection_config_single_atomic_record": true
+  },
+  "previous_lkg_full_runnable": {
+    "passed": 312,
+    "failed": 0,
+    "skipped": 60,
+    "deselected": 20
+  },
+  "ci_fix_targeted": {
+    "passed": 23,
+    "failed": 0,
+    "skipped": 1,
+    "deselected": 3
+  },
+  "official_runtime_acceptance": {
+    "cases": 5,
+    "executed_this_increment": false,
+    "workflow": "official-runtime-acceptance.yml",
+    "full_stack_accepted": false
+  },
+  "initial_remote_ci": {
+    "run_id": 36682336887,
+    "conclusion": "failure",
+    "windows_each": {
+      "passed": 367,
+      "failed": 7,
+      "skipped": 6,
+      "deselected": 21
+    },
+    "ubuntu_each": {
+      "passed": 312,
+      "failed": 0,
+      "skipped": 59,
+      "deselected": 21
+    },
+    "failure_classification": {
+      "controller_stub_signature": 2,
+      "missing_official_runtime": 5
+    }
   }
 }

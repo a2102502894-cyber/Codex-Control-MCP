@@ -6,9 +6,7 @@ from codex_control_mcp.bridge import Bridge
 from codex_control_mcp.config import Config
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-pytestmark = pytest.mark.skipif(
-    os.name != "nt", reason="Requires official Windows runtime"
-)
+WINDOWS_RUNTIME = pytest.mark.skipif(os.name != "nt", reason="Requires official Windows runtime")
 
 
 @pytest.fixture
@@ -34,6 +32,8 @@ def stopped(b, sid):
     pytest.fail("Owned process did not stop")
 
 
+@pytest.mark.integration
+@WINDOWS_RUNTIME
 def test_refresh_defers_active_session_and_disconnect_is_lost(bridge):
     b = bridge
     s = ok(
@@ -63,6 +63,8 @@ def test_refresh_defers_active_session_and_disconnect_is_lost(bridge):
     assert b.rpc.generation != generation  # A new execution may reconnect.
 
 
+@pytest.mark.integration
+@WINDOWS_RUNTIME
 def test_pty_resize_and_input(bridge):
     b = bridge
     s = ok(
@@ -103,6 +105,8 @@ def test_pty_resize_and_input(bridge):
     )
 
 
+@pytest.mark.integration
+@WINDOWS_RUNTIME
 def test_controlled_proxy_route_through_official_child(bridge):
     b = bridge
     observations = []
@@ -166,6 +170,7 @@ def test_non_object_arguments_rejected_without_crash(bridge):
     assert not r["ok"] and r["error"]["code"] == "invalid_arguments"
 
 
+@WINDOWS_RUNTIME
 def test_wsl_availability_is_reported_not_assumed(bridge):
     b = bridge
     result = b.execute(
