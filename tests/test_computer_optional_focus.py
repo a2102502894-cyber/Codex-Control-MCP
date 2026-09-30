@@ -6,7 +6,7 @@ import threading
 from codex_control_mcp.computer import OfficialComputer
 
 
-def test_optional_focus_requires_current_window_click_and_fresh_snapshot():
+def test_optional_focus_requires_current_window_click_and_fresh_snapshot(tmp_path):
     obj = OfficialComputer.__new__(OfficialComputer)
     obj.action_lock = threading.RLock()
     obj.verified_operations = set()
@@ -40,7 +40,12 @@ globalThis.ccmSky={
 };
 (async()=>{const AsyncFunction=Object.getPrototypeOf(async function(){}).constructor;for(const code of CODES){await new AsyncFunction(code)();}console.log(JSON.stringify({output,typed}));})().catch(e=>{console.error(e);process.exit(1)});
 '''.replace('CODES', json.dumps(codes))
-    result = subprocess.run([shutil.which('node'), '-'], input=program, capture_output=True, text=True, timeout=20)
+    # This exercises generated action JS, not Node's stdin transport. Using a
+    # file avoids an unnecessary Windows stdin writer/EOF handshake for the
+    # large generated program; retain the same bounded timeout and assertions.
+    script = tmp_path / 'controlled focus contract.js'
+    script.write_text(program, encoding='utf-8')
+    result = subprocess.run([shutil.which('node'), str(script)], capture_output=True, text=True, timeout=20)
     assert result.returncode == 0, result.stderr
     data = json.loads(result.stdout)
     assert data['typed'] == [{'window': {'id': 1, 'app': 'unit'}, 'text': 'allowed after explicit click'}]

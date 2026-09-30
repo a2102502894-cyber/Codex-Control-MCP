@@ -33,3 +33,12 @@ python -m pytest -q -m integration --tb=short --junitxml=runtime-results.xml tes
 ```
 
 不要用 `full_stack_accepted=true` 代替缺失的证据；fixture 测试、hosted Windows 单测和真正官方 Runtime 验收分别报告。
+
+
+## 分类修复后的 CI 与 CUA fixture 收尾
+
+[增量 CI 36685439579](https://github.com/a2102502894-cyber/Codex-Control-MCP/actions/runs/36685439579) 对应远端 `72b91348ed01b0525d88d13d2f19969bf333b59d`（本地 `5f93a84`；tree `036144795ee956488e5414d08f6405f2036cde23`）。Ubuntu 3.11/3.12 各 324 pass / 53 skip / 26 deselect；Windows 3.12 为 383 pass / 6 skip / 26 deselect。两项 controller 回归及三项新增合同测试在 Windows 已通过。Windows 3.11 为 382 pass / 1 fail / 6 skip / 26 deselect，唯一失败是 `test_computer_optional_focus` 的 Node stdin subprocess 超过 20 秒。原失败不可改称通过。
+
+该用例只验证已生成的动作 JavaScript，使用受控 sky fixture，无 GUI/模型/Runtime 调用；在同次 Windows 3.12 和两项 Linux 通过。日志只有 subprocess TimeoutExpired，没有足够信息证明具体 OS/管道根因。最小收尾改为 UTF-8 临时 `.js` 文件（文件名含空格）启动 Node，移除不属于该合同的 stdin writer/EOF 握手；20 秒超时、动作顺序、焦点/快照授权及四类错误断言全部保留，不自动重试、不新增 skip、不改生产 CUA。真实 Windows 验证仍交给后续 CI。
+
+针对性命令 `python -m pytest tests/test_computer_optional_focus.py tests/test_cua_compatibility_posix.py -q --tb=short --junitxml=evidence/durable-recovery/ci-focus-fix.xml` 为 9 pass，0.41 秒。同增量其他代码未变，沿用此前完整本地回归证据，不无谓重跑；新 CI 会验证最终 tree。真实 GUI/官方 Runtime 五项仍未验，full_stack_accepted=false。

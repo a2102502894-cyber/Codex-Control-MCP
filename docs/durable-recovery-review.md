@@ -140,3 +140,8 @@ git diff --check
 - 本地实际验证（源码变更后）：`python -m pytest tests/test_runtime_fixture_contracts.py tests/test_call_diagnostics.py tests/test_runtime_edges.py -m 'not integration' -q --tb=short --junitxml=evidence/durable-recovery/ci-fix-targeted.xml`，23 passed / 1 skipped / 3 deselected，exit 0；`python scripts/run_headless_tests.py tests -q -m 'not integration' --tb=short -o faulthandler_timeout=60 --junitxml=evidence/durable-recovery/ci-fix-final.xml`，324 passed / 54 skipped / 25 deselected，10.12 秒、exit 0。Python 取自 `/workspace/ccm-venv/bin/python`。compileall src/scripts/tests、pip check、diff --check 通过。`pytest --collect-only -q -m integration tests/test_runtime_edges.py tests/test_transport.py` 精确收集五项、其余四项 deselected。
 - 选择审计：上轮 Linux 60 skip 中五个 Runtime case 转为显式 deselect、一项 invalid-arguments 转为 pass；另新增 11 个 portable pass，得到 324 pass / 54 skip / 25 deselect。原 39 失败的历史 36 skip + 2 deselect + 1 pass 不改写。五项 Windows 环境失败没有被标记“修复通过”；两项 controller 真正回归修复和新增 Windows 测试待远端 CI。CI 原有 WSL -k 会使 Linux 多一个 deselect、少一个 skip。
 - 发布范围：仅已授权的新分支快进上传，API 可改变提交元数据但须核验最终 tree 等于本地；不合并 main、不触发 lab Runtime job、不部署、不改用户电脑、不配置凭据。远端增量 CI 终态另随交付回报；排队不计通过。
+
+
+### 同分支 CI 暴露的 CUA fixture 收尾
+
+基线本地 `5f93a84` / 远端 `72b9134`，tree 一致。CI run 36685439579 的三项矩阵成功，Windows 3.11 唯一失败是原 `tests/test_computer_optional_focus.py:test_optional_focus_requires_current_window_click_and_fresh_snapshot` 的 Node stdin 子进程 20 秒超时。不是 controller/Runtime 分类失败；具体管道/启动原因未证实。把受控 JS 放 UTF-8 临时文件交给 Node（有空格路径）以移除不必要的 stdin 传输；仍要求全部 typed/errors 断言、仍限 20 秒、无重试/跳过。生产 CUA/权限/状态未变。Linux 针对性 CUA 9 pass，日志/XML 为 ci-focus-fix；完整回归沿用前增量有效证据。源码回退 revert 此收尾，无迁移。随后 API 同分支 fast-forward 精确 tree，最终 CI 另附，不合并/部署。

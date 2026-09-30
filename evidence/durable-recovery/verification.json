@@ -101,5 +101,38 @@
       "controller_stub_signature": 2,
       "missing_official_runtime": 5
     }
+  },
+  "ci_classification_fix_remote": {
+    "commit": "72b91348ed01b0525d88d13d2f19969bf333b59d",
+    "tree": "036144795ee956488e5414d08f6405f2036cde23",
+    "run_id": 36685439579,
+    "ubuntu_each": {
+      "passed": 324,
+      "failed": 0,
+      "skipped": 53,
+      "deselected": 26
+    },
+    "windows_3_12": {
+      "passed": 383,
+      "failed": 0,
+      "skipped": 6,
+      "deselected": 26
+    },
+    "windows_3_11": {
+      "passed": 382,
+      "failed": 1,
+      "skipped": 6,
+      "deselected": 26
+    },
+    "failure": "controlled CUA Node stdin fixture exceeded unchanged 20 second timeout"
+  },
+  "ci_focus_fixture_fix": {
+    "passed": 9,
+    "failed": 0,
+    "skipped": 0,
+    "transport": "temporary UTF-8 JavaScript file; same 20 second subprocess timeout",
+    "production_changed": false,
+    "full_local_regression": "previous increment evidence retained; only changed fixture targeted again",
+    "final_remote_ci": "pending upload"
   }
 }
