@@ -28,6 +28,7 @@ from .rpc import AppServer
 from .schema import load_or_export, ALLOWED_METHODS
 from .sessions import SessionStore
 from .tools import validate_tool
+from .results import execution_error, promote_execution
 
 BACKEND_TIME = contextvars.ContextVar("backend_time", default=0.0)
 READ_TOOLS = {
@@ -58,9 +59,7 @@ FILE_WRITES = {
     "git_branch",
     "task_manage",
     "mcp_manage",
-    "mcp_tool_call",
     "host_manage",
-    "host_exec",
     "host_files",
     "skill_package",
 }
@@ -122,7 +121,7 @@ class Bridge:
                 self.rpc
                 and self.rpc.alive
                 and (
-                    self.rpc.pending
+                    self.rpc.pending or getattr(self.rpc, "uncertain", {})
                     or any(
                         s["state"] in ("starting", "running")
                         for s in self.sessions.list()
@@ -180,7 +179,7 @@ class Bridge:
         start = time.perf_counter()
         try:
             try:
-                result = future.result(timeout)
+                result = rpc.wait(future, timeout) if hasattr(rpc, "wait") else future.result(timeout)
             except concurrent.futures.TimeoutError as exc:
                 raise BridgeError(
                     "execution_state_unknown",
@@ -913,6 +912,7 @@ class Bridge:
             "runtime": runtime_view,
             "generation": self.rpc.generation,
             "pending_update": self.pending_update,
+            "execution_transport": self.rpc.observation() if hasattr(self.rpc, "observation") else None,
             "schema_hash": self.schema.hash,
             "permission_mode": self.cfg.permission_mode,
             "application_access_policy": self.cfg.application_access_policy,
@@ -1044,8 +1044,10 @@ class Bridge:
             required.add("browser")
         if self.cfg.computer_use_enabled:
             required.add("computer_use")
-        phase1_complete = inference == 0 and all(checks[name] == "PASS" for name in required)
-        overall = "degraded" if "FAIL" in checks.values() else (
+        transport = self.rpc.observation() if hasattr(self.rpc, "observation") else None
+        transport_degraded = bool(transport and (transport.get("write_stalled") or transport.get("unresolved_operations")))
+        phase1_complete = not transport_degraded and inference == 0 and all(checks[name] == "PASS" for name in required)
+        overall = "degraded" if transport_degraded or "FAIL" in checks.values() else (
             "healthy" if phase1_complete else "core_available_extensions_unverified"
         )
         return {
@@ -1064,6 +1066,7 @@ class Bridge:
             "proxy": self.proxy,
             "schema": self.schema_info,
             "pending_update": self.pending_update,
+            "execution_transport": transport,
             "model_evidence": {
                 "unapproved_rpc_calls_observed": inference,
                 "outgoing_methods": dict(self.audit.methods),
@@ -1090,6 +1093,8 @@ class Bridge:
         risk = (
             "read" if tool in READ_TOOLS
             or (tool == "git_branch" and a.get("action", "list") == "list")
+            or (tool in {"host_manage", "mcp_manage"} and a.get("action") in {"list", "get"})
+            or (tool == "host_files" and a.get("action") in {"read", "list", "search"})
             else "dangerous" if tool in (
                 "exec_command", "session_start", "file_delete", "session_kill",
                 "host_exec", "mcp_tool_call") else "write"
@@ -1117,7 +1122,7 @@ class Bridge:
             else:
                 self.audit.emit("tool_start", tool=tool, risk_level=risk, param_keys=sorted(a))
                 trace.mark("bridge_dispatch")
-                if tool in FILE_WRITES:
+                if tool in FILE_WRITES and not (tool == "host_files" and a.get("action") in {"read", "list", "search"}):
                     with self.write_lock:
                         data = self._do(tool, a)
                 else:
@@ -1126,22 +1131,13 @@ class Bridge:
                     "exec_command", "session_read", "file_patch", "git_commit",
                     "git_branch", "git_status", "git_diff", "git_log",
                     "search_files", "search_text",
+                    "host_exec", "host_files", "mcp_tool_call",
                 }
                 error = None
                 if tool in process_tools and isinstance(data, dict):
-                    if isinstance(data.get("error"), dict) and data["error"]:
-                        error = dict(data["error"])
-                    elif data.get("exit_code") not in (None, 0):
-                        error = {"code": "command_failed",
-                                 "message": "Command returned a nonzero exit code.",
-                                 "retryable": False,
-                                 "details": {"origin": "command_process",
-                                             "exit_code": data["exit_code"]}}
-                        if data["exit_code"] == 124:
-                            # 124 is also a valid explicit process exit. Do not
-                            # falsely claim a deadline was definitely enforced.
-                            error.update(code="command_exit_124", message="命令返回 124，可能达到运行期限，也可能由程序主动返回；请核对生效期限和输出。")
-                            error["details"].update(effective_timeout_ms=data.get("effective_timeout_ms", a.get("timeout_ms", 30000)), timeout_confirmed=False)
+                    error = execution_error(data)
+                    if tool in {"host_exec", "host_files", "mcp_tool_call"}:
+                        promote_execution(data)
                 out = {"ok": error is None, "tool": tool, "risk_level": risk,
                        "result": data, "error": error}
                 if error:

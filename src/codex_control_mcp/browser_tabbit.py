@@ -11,6 +11,9 @@ from .common import CREATE_NO_WINDOW, InstanceLock, atomic_json
 from .config import build_environment
 from .errors import BridgeError
 from .lifecycle import create_owned_process_job
+from .rpc_writer import PipeWriter
+
+REQUEST_TIMEOUT_SECONDS = 60
 
 
 class TabbitBrowser:
@@ -20,7 +23,7 @@ class TabbitBrowser:
         self.cfg, self.closed = cfg, False
         self.verified, self.verified_operations = False, set()
         self.lock = threading.RLock()
-        self.responses = queue.Queue()
+        self.responses = queue.Queue(maxsize=256)
         self.sequence = 0
         self.proc = self.job = self.profile_lock = None
         self.read_thread = self.error_thread = None
@@ -98,11 +101,29 @@ class TabbitBrowser:
             while raw := self.proc.stdout.readline(4 * 1024 * 1024 + 1):
                 if len(raw) > 4 * 1024 * 1024:
                     break
-                self.responses.put(json.loads(raw))
-        except (OSError, ValueError):
+                response = json.loads(raw)
+                if not isinstance(response, dict) or type(response.get('id')) is not int or ('result' in response) == ('error' in response):
+                    break
+                if 'error' in response and not isinstance(response['error'], dict):
+                    break
+                self.responses.put_nowait(response)
+        except (OSError, ValueError, queue.Full):
             pass
         finally:
-            self.responses.put(None)
+            self._connection_failed()
+
+    def _connection_failed(self):
+        try:
+            self.responses.put_nowait(None)
+        except queue.Full:
+            self.responses.get_nowait()
+            self.responses.put_nowait(None)
+
+    def _send(self, message):
+        if not hasattr(self, 'writer'):
+            self.writer = PipeWriter(self.proc.stdin)
+        raw = (json.dumps(message, ensure_ascii=True) + '\n').encode()
+        return self.writer.submit(raw, lambda: None, lambda error: self._connection_failed())
 
     def _drain(self):
         try:
@@ -117,12 +138,11 @@ class TabbitBrowser:
                 raise BridgeError('capability_unavailable', 'The owned Tabbit worker has stopped.')
             self.sequence += 1
             try:
-                self.proc.stdin.write((json.dumps({'id': self.sequence, 'tool': tool, 'args': args}, ensure_ascii=True) + '\n').encode())
-                self.proc.stdin.flush()
-                response = self.responses.get(timeout=60)
+                self._send({'id': self.sequence, 'tool': tool, 'args': args})
+                response = self.responses.get(timeout=REQUEST_TIMEOUT_SECONDS)
                 if response is None or response.get('id') != self.sequence:
                     raise OSError('Tabbit response stream closed')
-            except (OSError, ValueError, queue.Empty) as exc:
+            except (OSError, ValueError, queue.Empty, BridgeError) as exc:
                 self.close(force=True)
                 raise BridgeError('execution_state_unknown', 'The Tabbit connection was lost or timed out; the operation is not replayed.') from exc
             if response.get('error'):
@@ -153,17 +173,21 @@ class TabbitBrowser:
             if self.proc:
                 try:
                     if not force and self.proc.poll() is None:
-                        self.proc.stdin.write((json.dumps({'id': 0, 'tool': 'shutdown'})+'\n').encode())
-                        self.proc.stdin.flush()
+                        self._send({'id': 0, 'tool': 'shutdown'})
                         self.proc.wait(5)
-                except (OSError, ValueError, subprocess.TimeoutExpired):
+                except (OSError, ValueError, subprocess.TimeoutExpired, BridgeError):
                     pass
                 finally:
                     if self.job:
                         self.job.Close(); self.job = None
                     if self.proc.poll() is None:
                         self.proc.terminate(); self.proc.wait(5)
-                    self.proc.stdin.close()
+                    if hasattr(self, 'writer'):
+                        self.writer.stop()
+                        closer = self.writer.close_stream_when_drained()
+                        closer.join(1)
+                    else:
+                        self.proc.stdin.close()
                     for thread, stream in ((self.read_thread,self.proc.stdout),(self.error_thread,self.proc.stderr)):
                         if thread:
                             thread.join(1)

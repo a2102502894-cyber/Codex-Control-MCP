@@ -278,12 +278,12 @@ TOOL_SPECS = {
         ["action"],
     ),
     "host_exec": definition(
-        "在命名主机执行命令。local 复用官方 Codex Runtime；MCP 节点复用远端 exec_command；SSH/Docker 使用宿主执行层路由。",
+        "在命名主机执行命令，统一传播完成状态、下一步和失败。local/MCP 复用执行层；SSH/Docker 默认 auto，支持期限、分页、远端 cwd/env。远端 shell 路由不支持 TTY/WSL，明确拒绝不兼容 shell。运行中的宿主 SSH/Docker 会话用本机 session_read 读取；MCP 节点返回的会话须在对应节点读取。",
         {**EXEC, "host": {"type": "string", "minLength": 1}},
         ["host"],
     ),
     "host_files": definition(
-        "对命名主机执行 read/list/write/delete/search 文件操作；MCP 节点复用远端结构化文件工具。",
+        "对命名主机执行 read/list/write/delete/search 文件操作，传播真实错误。MCP 节点复用远端结构化工具；SSH/Docker 有界文本输出，默认写入拒绝覆盖，force=true 允许覆盖。范围与复杂过滤选项需 MCP 节点，shell 路由明确拒绝不支持的选项。",
         {
             "host": {"type": "string", "minLength": 1},
             "action": enum("read", "list", "write", "delete", "search"),

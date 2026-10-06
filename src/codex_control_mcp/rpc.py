@@ -1,9 +1,13 @@
 from __future__ import annotations
-import concurrent.futures, json, os, subprocess, threading, uuid
+import collections, concurrent.futures, json, os, subprocess, threading, time, uuid
 from . import __version__
 from .common import CREATE_NO_WINDOW, CURRENT_OPERATION, digest, is_admin
 from .diagnostics import CURRENT_TRACE
 from .errors import BridgeError
+from .rpc_writer import PipeWriter
+
+READ_RPC_METHODS = frozenset({"initialize", "fs/readFile", "fs/getMetadata", "fs/readDirectory",
+                              "mcpServerStatus/list", "remoteControl/status/read"})
 
 
 class AppServer:
@@ -13,6 +17,8 @@ class AppServer:
         self.write_lock = threading.Lock()
         self.lock = threading.RLock()
         self.pending = {}
+        self.uncertain = {}
+        self.abandoned = collections.OrderedDict()
         self.next_id = 0
         self.closed = False
         self.broken = False
@@ -105,21 +111,32 @@ class AppServer:
             if trace is not None:
                 trace.audit_failed()
 
+    def _sent(self, method, seq, future):
+        trace = getattr(future, "ccm_trace", None)
+        if trace is not None:
+            trace.rpc_event("rpc_send", method, seq, self.generation)
+        self._observe_after_dispatch("rpc_send", _trace=trace, method=method,
+                                     request_id=seq, param_keys=getattr(future, "ccm_param_keys", []),
+                                     generation=self.generation, operation_id=getattr(future, "ccm_operation_id", None))
+
     def _write(self, msg):
         raw = (
             json.dumps(msg, ensure_ascii=False, separators=(",", ":")) + "\n"
         ).encode("utf-8")
-        try:
-            with self.write_lock:
-                if self.closed:
-                    raise OSError("connection closed")
-                self.proc.stdin.write(raw)
-                self.proc.stdin.flush()
-        except (OSError, ValueError) as e:
-            raise BridgeError(
-                "execution_state_unknown",
-                "Official connection lost; operations are not replayed.",
-            ) from e
+        with self.lock:
+            if self.closed:
+                raise BridgeError("execution_state_unknown", "Official connection is closed; no replay is allowed.")
+            if not hasattr(self, "writer"):
+                self.writer = PipeWriter(self.proc.stdin)
+            item = self.pending.get(msg.get("id")) if "method" in msg else None
+        future = item[1] if item else None
+        def failed(error):
+            if future is not None:
+                self.abandon(future, error)
+            else:
+                self._observe_after_dispatch("rpc_notification_write_failed", generation=self.generation)
+        sent = (lambda: self._sent(item[0], msg["id"], future)) if item else (lambda: None)
+        return self.writer.submit(raw, sent, failed)
 
     def begin(self, method, params):
         self.schema.validate(method, params)
@@ -134,12 +151,16 @@ class AppServer:
                     "resource_limit",
                     "Official connection has too many outstanding requests.",
                 )
+            if method not in READ_RPC_METHODS and (len(getattr(self, "uncertain", {})) +
+                    sum(m not in READ_RPC_METHODS for m, _ in self.pending.values())) >= 256:
+                raise BridgeError("resource_limit", "Too many unresolved operations; reads remain available and no operation is replayed.")
             self.next_id += 1
             seq = self.next_id
             future = concurrent.futures.Future()
             future.ccm_operation_id = CURRENT_OPERATION.get()
             future.ccm_request_id = seq
             future.ccm_trace = CURRENT_TRACE.get()
+            future.ccm_param_keys = sorted(params) if isinstance(params, dict) else []
             self.pending[seq] = (method, future)
             try:
                 try:
@@ -155,20 +176,62 @@ class AppServer:
                         details={"origin": "bridge_runtime", "method": method,
                                  "request_id": seq, "operation_id": future.ccm_operation_id},
                     ) from exc
-                self._write({"id": seq, "method": method, "params": params})
-                if future.ccm_trace is not None:
-                    future.ccm_trace.rpc_event("rpc_send", method, seq, self.generation)
-                self._observe_after_dispatch(
-                    "rpc_send", _trace=future.ccm_trace,
-                    method=method,
-                    request_id=seq,
-                    param_keys=sorted(params) if isinstance(params, dict) else [],
-                    generation=self.generation,
-                )
+                future.ccm_write = self._write({"id": seq, "method": method, "params": params})
+                # In-memory test transports may dispatch synchronously.
+                if future.ccm_write is None:
+                    self._sent(method, seq, future)
             except Exception:
                 self.pending.pop(seq, None)
                 raise
         return future
+
+    def abandon(self, future, error=None):
+        error = error or BridgeError("execution_state_unknown", "Timed out waiting for the official response; no replay is allowed.",
+                                    details={"origin": "execution_transport"})
+        seq = getattr(future, "ccm_request_id", None)
+        with self.lock:
+            item = self.pending.get(seq)
+            if not item or item[1] is not future or future.done():
+                return
+            method = item[0]
+            write = getattr(future, "ccm_write", None)
+            phase = self.writer.cancel(write) if write is not None and hasattr(self, "writer") else "unknown"
+            phase = error.details.get("dispatch_state", phase)
+            self.pending.pop(seq, None)
+            if not hasattr(self, "uncertain"):
+                self.uncertain = {}
+                self.abandoned = collections.OrderedDict()
+            record = {"method": method, "request_id": seq,
+                      "operation_id": getattr(future, "ccm_operation_id", None)}
+            if method not in READ_RPC_METHODS and phase not in {"not_started", "cancelled"}:
+                self.uncertain[seq] = record
+            self.abandoned[seq] = record
+            while len(self.abandoned) > 256:
+                self.abandoned.popitem(last=False)
+            error.details.update(record, runtime_generation=self.generation, dispatch_state=phase)
+            future.set_exception(error)
+        self._observe_after_dispatch("rpc_wait_abandoned", method=method, request_id=seq,
+                                     dispatch_state=phase, generation=self.generation)
+
+    def wait(self, future, timeout):
+        try:
+            return future.result(max(0, timeout))
+        except concurrent.futures.TimeoutError:
+            self.abandon(future)
+            # A response may have won the race immediately before abandonment.
+            if future.done():
+                return future.result()
+            raise BridgeError("execution_state_unknown", "Official response deadline expired; no replay is allowed.",
+                              details={"origin": "execution_transport", "method": self.pending.get(getattr(future, "ccm_request_id", None), (None,))[0]})
+
+    def observation(self):
+        with self.lock:
+            result = {"pending_requests": len(self.pending),
+                      "unresolved_operations": len(getattr(self, "uncertain", {})),
+                      "abandoned_history_limit": 256}
+        if hasattr(self, "writer"):
+            result.update(self.writer.observation())
+        return result
 
     @staticmethod
     def validate_frame(msg):
@@ -200,15 +263,9 @@ class AppServer:
                     raise ValueError("Invalid protocol error")
 
     def call(self, method, params=None, timeout=30):
+        deadline = time.monotonic() + timeout
         future = self.begin(method, params)
-        try:
-            return future.result(timeout)
-        except concurrent.futures.TimeoutError as e:
-            raise BridgeError(
-                "execution_state_unknown",
-                "Timed out waiting for the official response; the operation may have executed.",
-                details={"method": method},
-            ) from e
+        return self.wait(future, deadline - time.monotonic())
 
     def _read(self):
         reason = "official App Server disconnected"
@@ -229,7 +286,13 @@ class AppServer:
                 if "id" in msg and "method" not in msg:
                     with self.lock:
                         item = self.pending.pop(msg["id"], None)
+                        late = getattr(self, "uncertain", {}).pop(msg["id"], None)
+                        late = getattr(self, "abandoned", {}).pop(msg["id"], None) or late
                     if not item:
+                        if late:
+                            self._observe_after_dispatch("rpc_late_response", method=late["method"],
+                                                         request_id=msg["id"], generation=self.generation,
+                                                         operation_id=late["operation_id"], response_kind="error" if "error" in msg else "result")
                         continue
                     method, f = item
                     operation_id = getattr(f, "ccm_operation_id", None)
@@ -309,6 +372,8 @@ class AppServer:
             with self.lock:
                 items = list(self.pending.values())
                 self.pending.clear()
+            if hasattr(self, "writer"):
+                self.writer.stop()
             for method, f in items:
                 if not f.done():
                     f.set_exception(
@@ -335,9 +400,14 @@ class AppServer:
             if self.closed:
                 return
             self.closed = True
+        input_closer = None
         try:
-            with self.write_lock:
+            if hasattr(self, "writer"):
+                self.writer.stop()
+                input_closer = self.writer.close_stream_when_drained()
+            else:
                 self.proc.stdin.close()
+                input_closer = None
             try:
                 self.proc.wait(4)
             except subprocess.TimeoutExpired:
@@ -352,6 +422,8 @@ class AppServer:
             if self.process_job is not None:
                 self.process_job.Close()
                 self.process_job = None
+            if input_closer is not None:
+                input_closer.join(timeout=1)
             self.read_thread.join(timeout=1)
             self.error_thread.join(timeout=1)
             for reader, stream in ((self.read_thread, self.proc.stdout),

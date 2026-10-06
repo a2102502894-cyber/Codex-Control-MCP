@@ -1,11 +1,14 @@
 """Local CLI access to the owner's already-running MCP service."""
 
+import asyncio
 import json
 import httpx
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from .auth import owner_token
 from .errors import BridgeError
+
+LOCAL_CALL_TIMEOUT_SECONDS = 180
 
 
 async def call_running_service(cfg, tool, args):
@@ -28,8 +31,11 @@ async def call_running_service(cfg, tool, args):
     url = f"http://{formatted}:{port}/mcp"
     token = owner_token(cfg)
     dispatched = False
+    timeout = LOCAL_CALL_TIMEOUT_SECONDS
+    if tool in {"exec_command", "host_exec"} and (args or {}).get("execution_mode") == "buffered":
+        timeout = max(timeout, (args or {}).get("timeout_ms", 30000) / 1000 + 20)
     try:
-        async with httpx.AsyncClient(
+        async with asyncio.timeout(timeout), httpx.AsyncClient(
             headers={"Authorization": "Bearer " + token},
             trust_env=False,
             timeout=httpx.Timeout(180, connect=2),

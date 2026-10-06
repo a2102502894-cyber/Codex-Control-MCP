@@ -15,6 +15,7 @@ from mcp.client.streamable_http import streamable_http_client
 
 from .common import atomic_json, utc_now
 from .errors import BridgeError
+from .results import execution_view
 
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 ESSENTIAL_ENV = {
@@ -309,4 +310,9 @@ class DynamicMCPManager:
             return result.model_dump(mode="json", by_alias=True, exclude_none=True)
 
         result = self._run(item, invoke, mutating=True)
-        return {"qualified_name": f"{server}:{tool_name}", "result": result}
+        out = {"qualified_name": f"{server}:{tool_name}", "result": result}
+        action = execution_view(result).get("next_action")
+        if isinstance(action, dict) and action.get("tool") in {t.get("name") for t in self._cached_tools(item)}:
+            out["next_action"] = {"tool": "mcp_tool_call", "arguments": {
+                "name": f"{server}:{action['tool']}", "arguments": action.get("arguments") or {}}}
+        return out
