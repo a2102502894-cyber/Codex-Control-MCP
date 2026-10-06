@@ -195,7 +195,7 @@ TOOL_SPECS = {
         read=True,
     ),
     "task_manage": definition(
-        "持久化可恢复任务状态：目标、步骤、检查点、阻塞原因、恢复、最终复核和完成条件。",
+        "持久化可恢复任务：全量验收或多步任务先 get/resume 对应任务或 create 完整目标、步骤和 completion_conditions。阶段总结后继续执行剩余授权工作，不能仅提出下一步就结束。checkpoint 的 steps/completion_conditions 只追加新范围，保留原必做项；不支持当前 action 的参数会明确拒绝。checkpoint 返回剩余项、continuation_required 和 next_required_action；工具返回成功不等于任务完成。final_review=pass 要求 active、步骤全部完成、missing_checks 为空、verified 有实际事实且逐字包含每条 completion_conditions。进度变更、block/resume 使复核失效；通过复核仍须 complete 返回 task_completed=true 才能宣告完成。更新建议传 expected_revision，冲突先 get 最新状态。仅完成、用户叫停或确实无法继续的阻断才收尾；阻断需记录原因和恢复点，并继续可独立推进的工作。该工具不会自动启动模型下一轮。",
         {
             "action": enum("create", "list", "get", "checkpoint", "block", "resume", "final_review", "complete"),
             "title": {"type": "string", "minLength": 1, "maxLength": 2048},

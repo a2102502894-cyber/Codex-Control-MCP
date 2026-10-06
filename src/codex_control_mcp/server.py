@@ -80,7 +80,27 @@ def make_server(bridge):
     server = Server(
         "Codex-Control-MCP",
         version=__version__,
-        instructions="Use official Codex runtime operations. Before working, tell the user the next action. exec_command defaults to auto: running is NOT completion. Poll session_read using session_id and next_cursor until a final exit code; report meaningful progress and never resubmit the same command because output is absent. Use computer_close in finally after each desktop workflow; the bridge also releases idle control after 120 seconds. A new workflow needs a fresh snapshot. Commands run as the service account with dangerFullAccess. No model turns are started by this server.",
+        instructions=(
+            "Use official Codex runtime operations. Before working, tell the user the next action. "
+            "For a multi-step or full-project acceptance request, use task_manage to get/resume the matching task "
+            "or create one with the user's full goal, all required steps and explicit completion_conditions. "
+            "A successful tool call or a completed subprocess does not complete the user's task. "
+            "Keep executing independent authorized remaining work after each stage summary; do not end with "
+            "a next-step proposal when you can perform it. Checkpoint progress and evidence, recover revision "
+            "conflicts by reading the latest task, and never overwrite or re-execute completed work blindly. "
+            "Only stop for completion, a user stop instruction, or a concrete blocker that prevents further "
+            "authorized progress. Record a blocker and exact resumption point; do not invent a blocker. "
+            "Before final delivery, get the current task, finish all steps, resolve missing_checks, "
+            "and submit final_review with each completion condition verbatim in verified plus supporting facts. "
+            "Use expected_revision for updates. A passing review is not completion: call complete and verify "
+            "task_completed=true before reporting the goal achieved. Changes after review require a new review. "
+            "exec_command defaults to auto: running is NOT completion. Poll session_read using session_id "
+            "and next_cursor until a final exit code; report meaningful progress and never resubmit the same "
+            "command because output is absent. Use computer_close in finally after each desktop workflow; "
+            "the bridge also releases idle control after 120 seconds. A new workflow needs a fresh snapshot. "
+            "Commands run as the service account with dangerFullAccess. No model turns are started by this server; "
+            "task state and continuation guidance cannot intercept a client's final reply or restart its model loop."
+        ),
     )
 
     server._ccm_audit = getattr(bridge, "audit", None)
