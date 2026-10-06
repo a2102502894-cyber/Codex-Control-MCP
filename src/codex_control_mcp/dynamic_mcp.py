@@ -159,12 +159,20 @@ class DynamicMCPManager:
                 await session.initialize()
                 return await operation(session)
 
-    def _run(self, item, operation):
+    def _run(self, item, operation, *, mutating=False):
+        async def bounded():
+            # An HTTP socket timeout does not bound stdio initialization or a
+            # server that keeps the stream open without answering tools/call.
+            async with asyncio.timeout(item.get("timeout_ms", 30000) / 1000):
+                return await self._with_session(item, operation)
         try:
-            return asyncio.run(self._with_session(item, operation))
+            return asyncio.run(bounded())
         except BridgeError:
             raise
         except Exception as exc:
+            if mutating:
+                raise BridgeError("execution_state_unknown", f"Dynamic MCP tool result unavailable ({type(exc).__name__}); no replay is allowed.", retryable=False,
+                                  details={"origin": "dynamic_mcp_transport", "timeout_ms": item.get("timeout_ms", 30000), "automatic_retry_performed": False}) from exc
             raise BridgeError("mcp_unavailable", f"Dynamic MCP operation failed ({type(exc).__name__}).", retryable=True) from exc
 
     def refresh(self, name):
@@ -300,5 +308,5 @@ class DynamicMCPManager:
             result = await session.call_tool(tool_name, arguments)
             return result.model_dump(mode="json", by_alias=True, exclude_none=True)
 
-        result = self._run(item, invoke)
+        result = self._run(item, invoke, mutating=True)
         return {"qualified_name": f"{server}:{tool_name}", "result": result}

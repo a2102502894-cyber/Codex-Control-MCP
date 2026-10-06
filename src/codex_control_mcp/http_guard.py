@@ -185,6 +185,9 @@ class OwnerHTTP:
         if b"content-length" in headers and total != length:
             return await self.error(send, 400, "Content-Length mismatch")
         body = bytes(body)
+        if not public:
+            from .http_observation import observe_rpc_body
+            observe_rpc_body(body)
         delivered = False
 
         async def bounded_receive():

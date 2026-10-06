@@ -47,7 +47,12 @@ def roundtrip(req, preapproved, callback=None):
     assert len(ingress) == 1 and ingress[0]["tool"] == "computer_snapshot"
     assert len(ingress[0]["operation_id"]) == 32
     # Keep permission-decision assertions independent of transport audit events.
-    return result, [(event, fields) for event, fields in events if event != "mcp_received"]
+    progress = [fields for event, fields in events if event == "mcp_progress_summary"]
+    assert len(progress) == 1 and not progress[0]["requested"]
+    serialized = [fields for event, fields in events if event == "mcp_result_serialized"]
+    assert len(serialized) == 1 and serialized[0]["result_json_bytes"] > 0
+    transport_events = {"mcp_received", "mcp_progress_summary", "mcp_result_serialized"}
+    return result, [(event, fields) for event, fields in events if event not in transport_events]
 
 
 @pytest.mark.parametrize("app", ["tabbit.exe", "NewlyInstalledFixture.exe", "Example.Package!App"])

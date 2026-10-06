@@ -46,6 +46,7 @@ EXEC = {
     "argv": array(S, 1, 1024),
     "cwd": S,
     "shell": enum("powershell", "cmd", "wsl"),
+    "shell_error_policy": enum("stop", "continue"),
     "wsl_distribution": S,
     "wsl_cwd": S,
     "env": {"type": "object", "additionalProperties": {"type": ["string", "null"]}},
@@ -66,15 +67,15 @@ TOOL_SPECS = {
         "返回真实安装、已验证能力、实验能力和不可用原因。", {}, read=True
     ),
     "exec_command": definition(
-        "执行 command 或 argv。默认 auto 最多等待约 1 秒，未完成时返回 session_id、已有输出和 next_cursor；必须继续 session_read 并向用户报告进度，直到取得最终退出码，禁止重发原命令。buffered 显式等待结束；session 立即返回。yield_time_ms 只控制本次等待，timeout_ms 控制进程期限。使用 dangerFullAccess，命令可能修改文件或访问网络。",
+        "执行 command 或 argv。默认 auto 最多等待约 1 秒，进程默认允许运行 1 小时；未完成时返回 session_id、已有输出和 next_cursor。必须继续 session_read 并报告进度，直到最终退出码，禁止重发原命令。默认输出页 32 KiB。PowerShell cmdlet 错误默认立即失败，可用 shell_error_policy=continue 恢复旧行为；外部程序退出码须显式检查。buffered 显式等待结束，默认期限 30 秒；session 立即返回。yield_time_ms 只控制本次等待，timeout_ms 控制进程期限。使用 dangerFullAccess。",
         EXEC,
     ),
     "session_start": definition(
         "通过官方执行层启动流式长任务。timeout_ms=0 明确禁用底层期限。", SESSION
     ),
     "session_read": definition(
-        "按游标读取本桥拥有的会话输出，报告截断和数据缺口。",
-        {"session_id": S, "cursor": integer(0, 9007199254740991), "max_bytes": integer(1024, 4194304)},
+        "按游标读取会话，默认返回 32 KiB 文本、运行状态和下一次游标；running 必须继续轮询。output_format 可选 text、chunks、raw（原始 Base64）、legacy（旧完整字段）。报告截断和数据缺口。",
+        {"session_id": S, "cursor": integer(0, 9007199254740991), "max_bytes": integer(1024, 4194304), "output_format": enum("text", "chunks", "raw", "legacy")},
         ["session_id"],
         True,
     ),

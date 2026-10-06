@@ -35,7 +35,7 @@ def test_auto_returns_partial_output_and_continuation_without_replaying():
     s.append({'deltaBase64': 'c3RhcnQK'})
     b, calls = auto_bridge(s)
     r = b._do('exec_command', {'argv': ['fixture'], 'yield_time_ms': 0})
-    assert len(calls) == 1 and calls[0]['timeout_ms'] == 30000
+    assert len(calls) == 1 and calls[0]['timeout_ms'] == 3600000
     assert r['stdout'] == 'start\n' and not r['completed']
     assert r['exit_code'] is None and r['next_action']['arguments']['cursor'] == 1
     s.append({'deltaBase64': 'ZW5kCg=='})

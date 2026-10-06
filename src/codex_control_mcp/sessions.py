@@ -1,5 +1,5 @@
 from __future__ import annotations
-import base64, codecs, collections, copy, dataclasses, json, threading, uuid
+import base64, codecs, collections, copy, dataclasses, json, threading, time, uuid
 from .common import CURRENT_OPERATION, atomic_json, utc_now
 from .errors import BridgeError
 
@@ -26,6 +26,11 @@ class Session:
     decoders: dict = dataclasses.field(default_factory=dict)
     finished: threading.Event = dataclasses.field(default_factory=threading.Event)
     origin_operation_id: str | None = dataclasses.field(default_factory=CURRENT_OPERATION.get)
+    timeout_ms: int = 3600000
+    started_monotonic: float = dataclasses.field(default_factory=time.monotonic)
+    finished_monotonic: float | None = None
+    last_output_at: str | None = None
+    last_read_at: str | None = None
 
     def append(self, params):
         raw = base64.b64decode(params.get("deltaBase64", ""), validate=True)
@@ -51,6 +56,7 @@ class Session:
         stream = params.get("stream", "stdout")
         with self.lock:
             self.total_output_bytes += len(raw)
+            self.last_output_at = utc_now()
             decoder = self.decoders.setdefault(
                 stream, codecs.getincrementaldecoder("utf-8")("replace")
             )
@@ -86,6 +92,7 @@ class Session:
 
     def finish(self, future):
         with self.lock:
+            self.finished_monotonic = time.monotonic()
             try:
                 data = future.result()
                 self.exit_code = data["exitCode"]
@@ -138,15 +145,22 @@ class Session:
                 "reconnect_scope": "same_bridge_and_official_connection_only",
                 "restartable": False,
                 "error": copy.deepcopy(self.error),
+                "effective_timeout_ms": self.timeout_ms,
+                "elapsed_ms": round(((self.finished_monotonic or time.monotonic()) - self.started_monotonic) * 1000),
+                "last_output_at": self.last_output_at,
+                "last_read_at": self.last_read_at,
             }
 
-    def read(self, cursor=0, max_bytes=262144):
+    def read(self, cursor=0, max_bytes=32768, output_format="legacy"):
         with self.lock:
             if type(cursor) is not int or not 0 <= cursor <= self.next_cursor:
                 raise BridgeError(
                     "invalid_arguments",
                     "Output cursor is outside the available stream.",
                 )
+            if type(max_bytes) is not int or not 1024 <= max_bytes <= 4194304 or output_format not in {"text", "chunks", "raw", "legacy"}:
+                raise BridgeError("invalid_arguments", "Invalid output page options.")
+            self.last_read_at = utc_now()
             oldest = self.events[0]["cursor"] if self.events else self.next_cursor
             out = []
             size = 0
@@ -154,21 +168,29 @@ class Session:
             for event in self.events:
                 if event["cursor"] < cursor:
                     continue
-                if out and size + event["size"] > max_bytes:
+                if out and (size + event["size"] > max_bytes or len(out) >= 1024):
                     break
                 out.append(dict(event))
                 size += event["size"]
                 next_cursor = event["cursor"] + 1
-            return {
+            result = {
                 **self.metadata(),
-                "chunks": out,
-                "stdout": "".join(x["text"] for x in out if x["stream"] == "stdout"),
-                "stderr": "".join(x["text"] for x in out if x["stream"] == "stderr"),
                 "next_cursor": next_cursor,
                 "oldest_cursor": oldest,
                 "cursor_gap": cursor < oldest,
                 "has_more": next_cursor < self.next_cursor,
             }
+            if output_format in {"text", "legacy"}:
+                result.update(stdout="".join(x["text"] for x in out if x["stream"] == "stdout"),
+                              stderr="".join(x["text"] for x in out if x["stream"] == "stderr"))
+            if output_format != "text":
+                keep = {"cursor", "stream", "size"} | ({"data_base64"} if output_format == "raw" else {"text"})
+                result["chunks"] = out if output_format == "legacy" else [{k: v for k, v in x.items() if k in keep} for x in out]
+            running = self.state in {"starting", "running"}
+            result.update(completed=not running, output_format=output_format, page_bytes=size,
+                          status_message="命令仍在运行，请继续读取会话。" if running else "命令已结束，请检查退出码和错误状态。",
+                          next_action={"tool": "session_read", "arguments": {"session_id": self.id, "cursor": next_cursor}} if running or result["has_more"] else None)
+            return result
 
 
 class SessionStore:

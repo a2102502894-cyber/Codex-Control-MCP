@@ -20,17 +20,20 @@ PROGRESS_INTERVAL_SECONDS = 5
 async def execute_with_progress(bridge, context, name, arguments):
     """Best-effort status; never replay or cancel an action on delivery failure."""
     progress_token = getattr(context.meta, "progressToken", None)
+    progress_observation = {"requested": progress_token is not None, "sent": 0, "failed_or_timed_out": 0, "client_display_confirmed": False}
     async def notify(progress, message):
         if progress_token is None:
             return
         try:
-            with anyio.move_on_after(1):
+            with anyio.move_on_after(1) as scope:
                 await context.session.send_progress_notification(
                     progress_token, progress, message=message,
                     related_request_id=context.request_id,
                 )
+            progress_observation["failed_or_timed_out" if scope.cancel_called else "sent"] += 1
         except Exception:
-            pass  # A disconnected progress consumer must not replay the action.
+            progress_observation["failed_or_timed_out"] += 1
+            # A disconnected progress consumer must not replay the action.
 
     async def heartbeat():
         elapsed = 0
@@ -47,12 +50,20 @@ async def execute_with_progress(bridge, context, name, arguments):
         audit = getattr(bridge, "audit", None)
         if audit is not None:
             audit.emit("mcp_received", tool=name, operation_id=operation_id)
-        return await anyio.to_thread.run_sync(bridge.execute, name, arguments)
+        out = await anyio.to_thread.run_sync(bridge.execute, name, arguments)
     finally:
         INCOMING_OPERATION.reset(incoming_token)
         if task:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+    out = dict(out)
+    out["progress_observation"] = dict(progress_observation)
+    if audit is not None:
+        try:
+            audit.emit("mcp_progress_summary", operation_id=operation_id, tool=name, **progress_observation)
+        except Exception:
+            out["progress_observation"]["audit_status"] = "degraded"
+    return out
 
 
 def tool_metadata(name, oauth_enabled):
@@ -175,14 +186,22 @@ def make_server(bridge):
                 result["upstream_mcp_client"] = upstream
         images = out.pop("_image_blocks", [])
         content = [
-            types.TextContent(type="text", text=json.dumps(out, ensure_ascii=False))
+            types.TextContent(type="text", text=json.dumps(out, ensure_ascii=False, separators=(",", ":")))
         ] + [
             types.ImageContent(type="image", data=x["data"], mimeType=x["mimeType"])
             for x in images
         ]
-        return types.CallToolResult(
+        result = types.CallToolResult(
             content=content, structuredContent=out, isError=not out["ok"]
         )
+        audit = getattr(bridge, "audit", None)
+        if audit is not None:
+            try:
+                audit.emit("mcp_result_serialized", operation_id=out.get("operation_id"), tool=name,
+                           result_json_bytes=len(result.model_dump_json(by_alias=True, exclude_none=True).encode("utf-8")))
+            except Exception:
+                pass  # Serialization telemetry must never discard an action's receipt.
+        return result
 
     return server
 

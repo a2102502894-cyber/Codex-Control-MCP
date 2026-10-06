@@ -37,6 +37,20 @@ function Get-FailureCount([string]$path){try{if(Test-Path $path){return [int]((G
 function Set-FailureCount([string]$path,[int]$count){try{[pscustomobject]@{count=$count;updated_at=(Get-Date).ToString('o')}|ConvertTo-Json -Compress|Set-Content -LiteralPath $path -Encoding UTF8}catch{}}
 function Clear-FailureCount([string]$path){try{Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue}catch{}}
 function Test-PublicMetadata{try{$r=Invoke-WebRequest -UseBasicParsing -Uri $publicMetadata -TimeoutSec 6;return ($r.StatusCode -eq 200)}catch{return $false}}
+function Test-Application{
+  try{
+    $task=Get-ScheduledTask -TaskName $controllerTask -ErrorAction Stop
+    $action=$task.Actions | Select-Object -First 1
+    # Derive the companion from the installed controller, not a user supplied URL.
+    if($action.Arguments -notmatch '^"([^"]+core_recovery_controller\.py)"'){return $false}
+    $probe=Join-Path (Split-Path $matches[1] -Parent) 'core_application_probe.py'
+    if(-not (Test-Path -LiteralPath $probe)){return $false}
+    $output=& $action.Execute $probe --home $ccmHome 2>$null
+    if($LASTEXITCODE -ne 0){return $false}
+    $proof=$output | ConvertFrom-Json -ErrorAction Stop
+    return ($proof.ok -eq $true -and $proof.command_probe -eq 'PASS')
+  }catch{return $false}
+}
 
 $activeLease=Get-ActiveLease
 if($activeLease){Log-Event 'maintenance_lease_active' ("owner="+$activeLease.owner+";pid="+$activeLease.pid);exit 0}
@@ -45,7 +59,8 @@ if($activeLease){Log-Event 'maintenance_lease_active' ("owner="+$activeLease.own
 # and fallback belong to the independent locked controller, never this tick.
 if(Test-Port 8774){
   Clear-FailureCount $coreFailureState
-  Log-Event 'core_watchdog_healthy'
+  if(Test-Application){Log-Event 'core_watchdog_healthy' 'authenticated_mcp_and_official_command_verified'}
+  else{Log-Event 'core_application_degraded' 'listener_alive;execution_or_receipt_unverified;no_automatic_restart'}
 }else{
   $failures=(Get-FailureCount $coreFailureState)+1
   Set-FailureCount $coreFailureState $failures

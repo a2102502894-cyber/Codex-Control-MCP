@@ -219,7 +219,8 @@ class Bridge:
         shell = a.get("shell", "powershell")
         if shell == "powershell":
             return ps_argv(
-                "[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);$OutputEncoding=[Console]::OutputEncoding;"
+                "$ErrorActionPreference='" + ("Continue" if a.get("shell_error_policy") == "continue" else "Stop") + "';$ProgressPreference='SilentlyContinue';"
+                + "[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);$OutputEncoding=[Console]::OutputEncoding;"
                 + command
             )
         if shell == "cmd":
@@ -290,6 +291,7 @@ class Bridge:
             else "not_observed",
             "execution_backend": "codex_app_server.command_exec",
             "effective_sandbox": "dangerFullAccess",
+            "effective_timeout_ms": timeout_ms,
         }
 
     def _require_success(self, data):
@@ -408,6 +410,7 @@ class Bridge:
         with self.ready_lock:
             self.ensure_ready()
             s = self.sessions.create(self.rpc.generation, cwd, a.get("tty", False))
+            s.timeout_ms = timeout
             params["processId"] = s.id
             try:
                 s.future = self.rpc.begin("command/exec", params)
@@ -443,10 +446,10 @@ class Bridge:
 
     def _command_auto(self, a):
         """Dispatch once, then yield a resumable receipt rather than hiding output."""
-        started = self._session_start({"timeout_ms": 30000, **a})
+        started = self._session_start({"timeout_ms": 3600000, **a})
         session = self.sessions.get(started["session_id"])
         session.finished.wait(a.get("yield_time_ms", 1000) / 1000)
-        result = session.read(max_bytes=a.get("output_limit_bytes", self.cfg.output_limit_bytes))
+        result = session.read(max_bytes=a.get("output_limit_bytes", min(self.cfg.output_limit_bytes, 32768)), output_format="text")
         result.pop("chunks", None)  # stdout/stderr already contain this page.
         if result.get("error"):
             raise BridgeError(result["error"]["code"], result["error"]["message"],
@@ -458,7 +461,7 @@ class Bridge:
             execution_backend="codex_app_server.command_exec",
             effective_sandbox="dangerFullAccess",
             completed=not running,
-            output_limit_bytes=a.get("output_limit_bytes", self.cfg.output_limit_bytes),
+            output_limit_bytes=a.get("output_limit_bytes", min(self.cfg.output_limit_bytes, 32768)),
             output_truncation="observed" if result["output_truncated"] else "not_observed",
             status_message="命令仍在运行，请继续读取此会话并报告进度。" if running else "命令已结束，请检查退出码。",
             next_action={"tool": "session_read", "arguments": {
@@ -584,7 +587,7 @@ class Bridge:
             # Cached output remains readable even if Codex is uninstalled,
             # disconnected or waiting for a compatible update.
             s = self.sessions.get(a["session_id"])
-            return s.read(a.get("cursor", 0), a.get("max_bytes", 262144))
+            return s.read(a.get("cursor", 0), a.get("max_bytes", 32768), a.get("output_format", "text"))
         if tool in ("session_write", "session_kill", "session_resize"):
             self.ensure_ready()
             s = self.sessions.get(a["session_id"], self.rpc.generation)
@@ -1134,6 +1137,11 @@ class Bridge:
                                  "retryable": False,
                                  "details": {"origin": "command_process",
                                              "exit_code": data["exit_code"]}}
+                        if data["exit_code"] == 124:
+                            # 124 is also a valid explicit process exit. Do not
+                            # falsely claim a deadline was definitely enforced.
+                            error.update(code="command_exit_124", message="命令返回 124，可能达到运行期限，也可能由程序主动返回；请核对生效期限和输出。")
+                            error["details"].update(effective_timeout_ms=data.get("effective_timeout_ms", a.get("timeout_ms", 30000)), timeout_confirmed=False)
                 out = {"ok": error is None, "tool": tool, "risk_level": risk,
                        "result": data, "error": error}
                 if error:
