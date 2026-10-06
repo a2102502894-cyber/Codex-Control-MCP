@@ -627,32 +627,52 @@ class Bridge:
                     "encoding_error", "File cannot be decoded using requested encoding."
                 )
             lines = content.splitlines(keepends=True)
-            start = a.get("start_line", 1)
+            encoded_all = content.encode("utf-8")
+            sha = digest(raw)
+            if a.get("expected_sha256") is not None and a["expected_sha256"] != sha:
+                raise BridgeError("concurrent_modification", "File changed before continuation; start a fresh read.")
+            if "utf8_offset" in a:
+                if "start_line" in a or "end_line" in a or not a.get("expected_sha256"):
+                    raise BridgeError("invalid_arguments", "UTF-8 continuation requires expected_sha256 and cannot use start_line/end_line.")
+                begin = a["utf8_offset"]
+                if begin > len(encoded_all):
+                    raise BridgeError("invalid_arguments", "utf8_offset is beyond decoded content.")
+                try:
+                    prefix = encoded_all[:begin].decode("utf-8")
+                    remaining = encoded_all[begin:].decode("utf-8")
+                except UnicodeError as exc:
+                    raise BridgeError("invalid_arguments", "utf8_offset must be at a character boundary.") from exc
+                start = len(prefix.splitlines(keepends=True)) + (0 if prefix and not prefix.endswith(("\n", "\r", "\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029")) else 1)
+            else:
+                start = a.get("start_line", 1)
+                prefix = "".join(lines[:start - 1])
+                begin = len(prefix.encode("utf-8"))
+                remaining = "".join(lines[start - 1:])
             count = a.get("max_lines", 200)
             if a.get("end_line") is not None:
                 if a["end_line"] < start:
-                    raise BridgeError(
-                        "invalid_arguments", "end_line must be at or after start_line."
-                    )
+                    raise BridgeError("invalid_arguments", "end_line must be at or after start_line.")
                 count = a["end_line"] - start + 1
-            text = "".join(lines[start - 1 : start - 1 + count])
+            selected = remaining.splitlines(keepends=True)[:count]
+            text = "".join(selected)
             limit = a.get("max_bytes", 262144)
             encoded = text.encode("utf-8")
-            truncated = len(encoded) > limit
-            if truncated:
+            byte_truncated = len(encoded) > limit
+            if byte_truncated:
                 text = encoded[:limit].decode("utf-8", "ignore")
+            next_offset = begin + len(text.encode("utf-8"))
+            more = next_offset < len(encoded_all)
             return {
-                "path": path,
-                "content": text,
-                "sha256": digest(raw),
-                "file_bytes": len(raw),
-                "total_lines": len(lines),
-                "start_line": start,
-                "lines_returned": len(text.splitlines()),
-                "truncated": truncated or start - 1 + count < len(lines),
-                "next_line": None
-                if truncated
-                else (start + count if start - 1 + count < len(lines) else None),
+                "path": path, "content": text, "sha256": sha,
+                "file_bytes": len(raw), "decoded_utf8_bytes": len(encoded_all),
+                "total_lines": len(lines), "start_line": start,
+                "lines_returned": len(text.splitlines()), "truncated": more,
+                "next_line": start + len(selected) if more and not byte_truncated else None,
+                "utf8_offset": begin, "next_utf8_offset": next_offset if more else None,
+                "next_action": {"tool": "read_file", "arguments": {
+                    "path": path, "utf8_offset": next_offset, "expected_sha256": sha,
+                    "encoding": a.get("encoding", "utf-8"), "max_bytes": limit, "max_lines": min(count, 100000),
+                }} if more else None,
                 "has_utf8_bom": raw.startswith(b"\xef\xbb\xbf"),
                 "backend": "codex_app_server.fs.readFile",
             }

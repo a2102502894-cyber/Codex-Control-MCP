@@ -62,6 +62,9 @@ def emit(obj):
 
 
 def main():
+    if sys.argv[1:] == ["--internal-validate-mcp-arguments"]:
+        from .schema_worker import main as validate_arguments
+        return validate_arguments()
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     args = parser().parse_args()

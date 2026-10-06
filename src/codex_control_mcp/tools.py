@@ -98,9 +98,11 @@ TOOL_SPECS = {
         "仅列本桥当前和历史会话，不枚举 Desktop 私有线程。", {}, read=True
     ),
     "read_file": definition(
-        "经官方执行层有界读取文件；返回内容 SHA-256、行范围、截断及续读位置。",
+        "经官方执行层有界读取文件；返回内容 SHA-256、行范围、截断及 next_action。超长行用 next_utf8_offset 续读（解码文本的 UTF-8 字节位置），须带 expected_sha256，不能同时指定 start_line/end_line。",
         {
             "path": S,
+            "utf8_offset": integer(0, 268435456),
+            "expected_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
             "start_line": integer(1),
             "end_line": integer(1),
             "max_lines": integer(1, 100000),
@@ -283,7 +285,7 @@ TOOL_SPECS = {
         ["host"],
     ),
     "host_files": definition(
-        "对命名主机执行 read/list/write/delete/search 文件操作，传播真实错误。MCP 节点复用远端结构化工具；SSH/Docker 有界文本输出，默认写入拒绝覆盖，force=true 允许覆盖。范围与复杂过滤选项需 MCP 节点，shell 路由明确拒绝不支持的选项。",
+        "对命名主机执行 read/list/write/delete/search 文件操作，传播真实错误。MCP 节点复用远端结构化工具；SSH/Docker 有界文本输出，默认写入拒绝覆盖，shell 写入的 force=true 允许覆盖；local/MCP file_add 仅创建新文件，明确拒绝 force 覆盖。范围与复杂过滤选项需 MCP 节点，shell 路由明确拒绝不支持的选项。",
         {
             "host": {"type": "string", "minLength": 1},
             "action": enum("read", "list", "write", "delete", "search"),
@@ -294,6 +296,8 @@ TOOL_SPECS = {
             "force": B,
             "offset": integer(0, 1000000),
             "limit": integer(1, 5000),
+            "utf8_offset": integer(0, 268435456),
+            "expected_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
             "max_lines": integer(1, 100000),
             "max_bytes": integer(1024, 4194304),
             "encoding": S,

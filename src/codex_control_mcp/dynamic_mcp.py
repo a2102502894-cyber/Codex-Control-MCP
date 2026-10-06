@@ -1,14 +1,21 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import os
 import pathlib
 import re
+import time
+import threading
+import subprocess
+import sys
 import urllib.parse
 
 import httpx
 from jsonschema import Draft7Validator
+from jsonschema.validators import validator_for
+from referencing import Registry
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamable_http_client
@@ -23,6 +30,12 @@ ESSENTIAL_ENV = {
     "LOCALAPPDATA", "HOMEDRIVE", "HOMEPATH", "COMSPEC", "PATHEXT",
 }
 
+def validation_argv():
+    # Frozen applications are not Python interpreters. Both distributions use
+    # the same worker, before configuration/authentication/service startup.
+    return ([sys.executable, "--internal-validate-mcp-arguments"] if getattr(sys, "frozen", False) else
+            [sys.executable, "-I", "-m", "codex_control_mcp.schema_worker"])
+
 
 class DynamicMCPManager:
     """Persistent registry and on-demand client for independent MCP servers."""
@@ -31,6 +44,8 @@ class DynamicMCPManager:
         self.cfg = cfg
         self.path = pathlib.Path(cfg.home) / "state" / "dynamic-mcp.json"
         self.servers = self._load()
+        self._persisted = copy.deepcopy(self.servers)
+        self._registry_lock = threading.RLock()
 
     def _load(self):
         if not self.path.exists():
@@ -39,10 +54,18 @@ class DynamicMCPManager:
             data = json.loads(self.path.read_text("utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise BridgeError("mcp_registry_corrupt", "Dynamic MCP registry cannot be read.") from exc
-        return data if isinstance(data, dict) else {}
+        if not isinstance(data, dict) or any(not isinstance(value, dict) for value in data.values()):
+            raise BridgeError("mcp_registry_corrupt", "Dynamic MCP registry must contain server records.")
+        return data
 
     def _save(self):
-        atomic_json(self.path, self.servers)
+        with self._registry_lock:
+            try:
+                atomic_json(self.path, self.servers)
+            except Exception:
+                self.servers = copy.deepcopy(self._persisted)
+                raise
+            self._persisted = copy.deepcopy(self.servers)
 
     def _name(self, value):
         value = str(value or "").strip()
@@ -51,13 +74,18 @@ class DynamicMCPManager:
         return value
 
     def _public(self, item):
+        parsed = urllib.parse.urlsplit(item.get("url", ""))
+        # Connection secrets stay in the private registry, never in receipts.
+        netloc = parsed.netloc.rsplit("@", 1)[-1]
+        query = urllib.parse.urlencode([(key, "[redacted]") for key, _ in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)])
+        public_url = urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path, query, ""))
         return {
             "name": item["name"],
             "description": item.get("description", ""),
             "transport": item["transport"],
-            "url": item.get("url", ""),
+            "url": public_url,
             "command": item.get("command", ""),
-            "args": item.get("args", []),
+            "args": ["[redacted]" for _ in item.get("args", [])],
             "cwd": item.get("cwd", ""),
             "enabled": bool(item.get("enabled", True)),
             "timeout_ms": int(item.get("timeout_ms", 30000)),
@@ -108,14 +136,50 @@ class DynamicMCPManager:
             if not command:
                 raise BridgeError("invalid_arguments", "stdio requires command.")
             item["command"] = command
-            item["args"] = list(args.get("args", item.get("args", [])) or [])
+            arguments = args.get("args", item.get("args", [])) or []
+            if not isinstance(arguments, list) or not all(isinstance(v, str) for v in arguments):
+                raise BridgeError("invalid_arguments", "stdio args must be an array of strings.")
+            item["args"] = list(arguments)
             item["cwd"] = str(args.get("cwd", item.get("cwd", "")) or "").strip()
             item["url"] = ""
         item.setdefault("tools", [])
         item.setdefault("status", "never_refreshed")
         item.setdefault("last_error", "")
         item.setdefault("refreshed_at", "")
+        connection_keys = ("transport", "url", "command", "args", "cwd", "headers", "header_files", "header_prefixes", "env", "env_from_env", "env_files")
+        if existing and any(item.get(key) != existing.get(key) for key in connection_keys):
+            item.update(tools=[], status="never_refreshed", last_error="", refreshed_at="")
         return item
+
+    def _validator(self, schema):
+        # Close schema resolution before validation: jsonschema's default
+        # retriever can read files or open unbounded HTTP connections.
+        try:
+            pending = [(schema, 0)]
+            nodes = 0
+            while pending:
+                value, depth = pending.pop()
+                nodes += 1
+                if nodes > 10000 or depth > 64:
+                    raise ValueError("schema budget")
+                if isinstance(value, dict):
+                    if "$ref" in value and (not isinstance(value["$ref"], str) or not value["$ref"].startswith("#")):
+                        raise ValueError("external reference")
+                    if value.get("$id"):
+                        raise ValueError("schema base URI")
+                    pending.extend((child, depth + 1) for child in value.values())
+                elif isinstance(value, list):
+                    pending.extend((child, depth + 1) for child in value)
+            if len(json.dumps(schema, allow_nan=False).encode("utf-8")) > 262144:
+                raise ValueError("schema size")
+            default = None if isinstance(schema, dict) and "$schema" in schema else Draft7Validator
+            validator_class = validator_for(schema, default=default)
+            if validator_class is None:
+                raise ValueError("unsupported schema dialect")
+            validator_class.check_schema(schema)
+            return validator_class(schema, registry=Registry())
+        except Exception as exc:
+            raise BridgeError("mcp_schema_invalid", "Cached tool schema is invalid or requires unsupported external resolution.") from exc
 
     def _headers(self, item):
         headers = dict(item.get("headers") or {})
@@ -176,7 +240,7 @@ class DynamicMCPManager:
                                   details={"origin": "dynamic_mcp_transport", "timeout_ms": item.get("timeout_ms", 30000), "automatic_retry_performed": False}) from exc
             raise BridgeError("mcp_unavailable", f"Dynamic MCP operation failed ({type(exc).__name__}).", retryable=True) from exc
 
-    def refresh(self, name):
+    def refresh(self, name, *, timeout_ms=None):
         name = self._name(name)
         item = self.servers.get(name)
         if not item:
@@ -185,25 +249,56 @@ class DynamicMCPManager:
             raise BridgeError("mcp_disabled", "Dynamic MCP server is disabled.")
 
         async def list_tools(session):
-            result = await session.list_tools()
-            return [tool.model_dump(mode="json", by_alias=True, exclude_none=True) for tool in result.tools]
+            tools, names, cursors = [], set(), set()
+            cursor = None
+            size = 0
+            for _ in range(100):
+                result = await session.list_tools() if cursor is None else await session.list_tools(cursor=cursor)
+                for tool in result.tools:
+                    value = tool.model_dump(mode="json", by_alias=True, exclude_none=True)
+                    name = value.get("name")
+                    if not isinstance(name, str) or not name or name in names:
+                        raise BridgeError("mcp_schema_invalid", "Tool names must be nonempty and unique across pages.")
+                    self._validator(value.get("inputSchema", {"type": "object"}))
+                    size += len(json.dumps(value).encode("utf-8"))
+                    if len(tools) >= 1000 or size > 4 * 1024 * 1024:
+                        raise BridgeError("mcp_schema_invalid", "Tool listing exceeds the cache budget.")
+                    names.add(name)
+                    tools.append(value)
+                cursor = getattr(result, "nextCursor", None)
+                if cursor is None:
+                    return tools
+                if not isinstance(cursor, str) or not cursor or cursor in cursors:
+                    raise BridgeError("mcp_schema_invalid", "Tool listing returned an invalid or repeated cursor.")
+                cursors.add(cursor)
+            raise BridgeError("mcp_schema_invalid", "Tool listing exceeded the page limit.")
 
         try:
-            tools = self._run(item, list_tools)
-            item["tools"] = tools
-            item["status"] = "ready"
-            item["last_error"] = ""
-            item["refreshed_at"] = utc_now()
-            self._save()
+            run_item = item if timeout_ms is None else {**item, "timeout_ms": min(item.get("timeout_ms", 30000), timeout_ms)}
+            tools = self._run(run_item, list_tools)
+            with self._registry_lock:
+                if self.servers.get(name) is not item:
+                    raise BridgeError("mcp_registry_changed", "Server configuration changed during refresh; retry the read explicitly.")
+                item["tools"] = tools
+                item["status"] = "ready"
+                item["last_error"] = ""
+                item["refreshed_at"] = utc_now()
+                self._save()
             return {"server": self._public(item), "tools": [{"name": t.get("name"), "description": t.get("description", "")} for t in tools]}
         except BridgeError as exc:
-            item["status"] = "error"
-            item["last_error"] = exc.code
-            item["refreshed_at"] = utc_now()
-            self._save()
+            with self._registry_lock:
+                if self.servers.get(name) is item:
+                    item["status"] = "error"
+                    item["last_error"] = exc.code
+                    item["refreshed_at"] = utc_now()
+                    self._save()
             raise
 
     def manage(self, args):
+        with self._registry_lock:
+            return self._manage(args)
+
+    def _manage(self, args):
         action = str(args.get("action") or "").strip().lower()
         name = str(args.get("name") or "").strip()
         if action == "list":
@@ -265,19 +360,31 @@ class DynamicMCPManager:
         server_filter = str(args.get("server") or "").strip()
         limit = max(1, min(int(args.get("limit") or 20), 100))
         results = []
+        errors = []
+        deadline = time.monotonic() + 30
         for name, item in sorted(self.servers.items()):
             if server_filter and name != server_filter:
                 continue
             if not item.get("enabled", True):
                 continue
-            for tool in self._cached_tools(item):
+            if not item.get("tools"):
+                remaining = int((deadline - time.monotonic()) * 1000)
+                if remaining <= 0:
+                    errors.append({"server": name, "code": "search_deadline_exceeded"})
+                    continue
+                try:
+                    self.refresh(name, timeout_ms=remaining)
+                except BridgeError as exc:
+                    errors.append({"server": name, "code": exc.code})
+                    continue
+            for tool in item.get("tools") or []:
                 hay = " ".join([str(tool.get("name", "")), str(tool.get("title", "")), str(tool.get("description", ""))]).lower()
                 if query and all(part not in hay for part in query.split()):
                     continue
                 results.append({"name": tool.get("name"), "qualified_name": f"{name}:{tool.get('name')}", "title": tool.get("title", ""), "description": tool.get("description", ""), "server": name})
                 if len(results) >= limit:
-                    return {"tools": results, "count": len(results)}
-        return {"tools": results, "count": len(results)}
+                    return {"tools": results, "count": len(results), "partial": bool(errors), "errors": errors}
+        return {"tools": results, "count": len(results), "partial": bool(errors), "errors": errors}
 
     def inspect(self, args):
         server, tool_name = self._qualified(args.get("name"))
@@ -297,13 +404,29 @@ class DynamicMCPManager:
         tool = next((t for t in self._cached_tools(item) if t.get("name") == tool_name), None)
         if not tool:
             raise BridgeError("mcp_tool_not_found", "Dynamic MCP tool was not found in the latest schema.")
-        arguments = args.get("arguments") or {}
+        arguments = args.get("arguments", {})
         if not isinstance(arguments, dict):
             raise BridgeError("invalid_arguments", "arguments must be an object.")
-        schema = tool.get("inputSchema") or tool.get("input_schema") or {"type": "object"}
-        errors = sorted(Draft7Validator(schema).iter_errors(arguments), key=lambda e: list(e.path))
-        if errors:
-            raise BridgeError("invalid_arguments", "Dynamic MCP tool arguments failed cached schema validation.", details={"validation_error": errors[0].message})
+        schema = tool.get("inputSchema", tool.get("input_schema", {"type": "object"}))
+        self._validator(schema)
+        try:
+            checked = subprocess.run(
+                validation_argv(),
+                input=json.dumps([schema, arguments], allow_nan=False).encode("utf-8"),
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                timeout=min(item.get("timeout_ms", 30000) / 1000, 5),
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            if checked.returncode:
+                raise ValueError("validator failed")
+            verdict = json.loads(checked.stdout)
+        except subprocess.TimeoutExpired as exc:
+            raise BridgeError("mcp_validation_timeout", "Tool argument validation exceeded its computation deadline; no tool was executed.",
+                              details={"origin": "cached_schema_validation", "automatic_retry_performed": False}) from exc
+        except Exception as exc:
+            raise BridgeError("mcp_schema_invalid", "Cached schema could not be evaluated; no tool was executed.") from exc
+        if not verdict["valid"]:
+            raise BridgeError("invalid_arguments", "Dynamic MCP tool arguments failed cached schema validation; values are not returned.", details={"validation_rule": verdict["rule"]})
 
         async def invoke(session):
             result = await session.call_tool(tool_name, arguments)

@@ -26,6 +26,8 @@ class SchemaRegistry:
     def __init__(self, folder):
         self.folder = folder
         self.doc = json.loads((folder / "ClientRequest.json").read_text("utf-8"))
+        if not isinstance(self.doc, dict):
+            raise ValueError("Request Schema must be an object.")
         self.methods = {}
         for variant in self.doc.get("oneOf", self.doc.get("anyOf", [])):
             p = variant.get("properties", {})
@@ -174,11 +176,13 @@ def load_or_export(cfg, runtime, force=False):
     if state.exists():
         try:
             oldinfo = json.loads(state.read_text("utf-8"))
-        except ValueError:
+            if not isinstance(oldinfo, dict):
+                oldinfo = {}
+        except (ValueError, OSError):
             pass
     oldreg = None
     oldpath = oldinfo.get("schema_path")
-    if oldpath and cache_path(oldpath).is_dir():
+    if isinstance(oldpath, str) and oldpath and cache_path(oldpath).is_dir():
         try:
             oldreg = SchemaRegistry(cache_path(oldpath))
         except (OSError, ValueError):

@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import base64
+import copy
 import json
 import os
 import pathlib
 import re
 import shlex
+import threading
 
 from .common import atomic_json, ps_quote
 from .errors import BridgeError
 from .results import execution_view
+from .tools import validate_tool
 
 
 class HostManager:
@@ -20,6 +23,8 @@ class HostManager:
         self.dynamic_mcp = dynamic_mcp
         self.path = pathlib.Path(bridge.cfg.home) / "state" / "hosts.json"
         self.hosts = self._load()
+        self._persisted = copy.deepcopy(self.hosts)
+        self._registry_lock = threading.RLock()
 
     def _load(self):
         if not self.path.exists():
@@ -28,10 +33,18 @@ class HostManager:
             data = json.loads(self.path.read_text("utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise BridgeError("host_registry_corrupt", "Host registry cannot be read.") from exc
-        return data if isinstance(data, dict) else {}
+        if not isinstance(data, dict) or any(not isinstance(value, dict) for value in data.values()):
+            raise BridgeError("host_registry_corrupt", "Host registry must contain host records.")
+        return data
 
     def _save(self):
-        atomic_json(self.path, self.hosts)
+        with self._registry_lock:
+            try:
+                atomic_json(self.path, self.hosts)
+            except Exception:
+                self.hosts = copy.deepcopy(self._persisted)
+                raise
+            self._persisted = copy.deepcopy(self.hosts)
 
     def _name(self, value, allow_local=True):
         value = str(value or "").strip()
@@ -61,6 +74,10 @@ class HostManager:
         return item
 
     def manage(self, args):
+        with self._registry_lock:
+            return self._manage(args)
+
+    def _manage(self, args):
         action = str(args.get("action") or "").strip().lower()
         if action == "list":
             items = [self._local()] + [self._public(v) for _, v in sorted(self.hosts.items())]
@@ -95,10 +112,15 @@ class HostManager:
                 item["identity_file"] = str(args.get("identity_file", old.get("identity_file", "")) or "").strip()
                 if not item["address"] or not item["user"] or not 1 <= item["port"] <= 65535:
                     raise BridgeError("invalid_arguments", "ssh requires address, user, and a valid port.")
+                if any(value.startswith("-") or "@" in value or any(ch.isspace() or ord(ch) < 32 for ch in value)
+                       for value in (item["address"], item["user"])):
+                    raise BridgeError("invalid_arguments", "SSH address/user must be literal destinations, not options or compound targets.")
             else:
                 item["container"] = str(args.get("container") or old.get("container") or "").strip()
                 if not item["container"]:
                     raise BridgeError("invalid_arguments", "docker transport requires container.")
+                if item["container"].startswith("-") or any(ch.isspace() or ord(ch) < 32 for ch in item["container"]):
+                    raise BridgeError("invalid_arguments", "Container must be a literal name or ID, not command options.")
             self.hosts[name] = item
             self._save()
             return {"action": action, "host": self._public(item), "registry": str(self.path)}
@@ -234,37 +256,80 @@ class HostManager:
         if action not in {"read", "list", "write", "delete", "search"} or not path:
             raise BridgeError("invalid_arguments", "host_files requires action read/list/write/delete/search and path.")
         local_map = {"read": "read_file", "list": "list_dir", "write": "file_add", "delete": "file_delete", "search": "search_text"}
+        options = {
+            "read": {"max_lines", "max_bytes", "encoding", "utf8_offset", "expected_sha256"},
+            "list": {"offset", "limit", "recursive", "max_bytes"},
+            "write": {"content", "force", "encoding"},
+            "delete": {"recursive", "force"},
+            "search": {"query", "recursive", "glob", "regex", "max_depth", "max_results", "max_bytes"},
+        }
+        extras = set(args) - options[action] - {"host", "action", "path", "idempotency_key"}
+        if extras:
+            raise BridgeError("invalid_arguments", "Options do not apply to this file action.", details={"unsupported_options": sorted(extras)})
+        if action == "write" and "content" not in args:
+            raise BridgeError("invalid_arguments", "write requires content (which may be empty).")
         if item["transport"] == "local":
-            payload = {k: v for k, v in args.items() if k not in {"host", "action"}}
+            payload = self._structured_file_args(action, args)
+            validate_tool(local_map[action], payload)
             return {"host": "local", "route": "official_codex_runtime", "result": self.bridge._do(local_map[action], payload)}
         if item["transport"] == "mcp":
             tool = local_map[action]
-            payload = {k: v for k, v in args.items() if k not in {"host", "action"}}
+            payload = self._structured_file_args(action, args)
             return {"host": item["name"], "route": "dynamic_mcp", "result": self.dynamic_mcp.call({"name": f"{item['mcp_server']}:{tool}", "arguments": payload})}
         windows = item.get("platform") == "windows"
-        unsupported = [k for k in ("offset", "limit", "max_lines", "glob", "max_depth", "max_results") if k in args]
+        unsupported = [k for k in ("offset", "limit", "max_lines", "glob", "max_depth", "max_results", "utf8_offset", "expected_sha256") if k in args]
         if unsupported or args.get("regex") or args.get("encoding", "utf-8").lower().replace("_", "-") not in {"utf-8", "utf8"}:
             raise BridgeError("invalid_arguments", "These range/filter options require a structured MCP node; the remote shell route cannot silently ignore them.", details={"unsupported_options": unsupported})
         if action == "read":
-            command = f"Get-Content -Raw -LiteralPath {ps_quote(path)}" if windows else f"cat -- {shlex.quote(path)}"
+            command = f"Get-Content -Raw -Encoding UTF8 -LiteralPath {ps_quote(path)}" if windows else f"cat -- {shlex.quote(path)}"
         elif action == "list":
-            command = f"Get-ChildItem -Force -LiteralPath {ps_quote(path)} | Select-Object Name,Length,Mode | ConvertTo-Json -Compress" if windows else f"ls -la -- {shlex.quote(path)}"
+            command = f"Get-ChildItem -Force {'-Recurse ' if args.get('recursive') else ''}-LiteralPath {ps_quote(path)} | Select-Object FullName,Name,Length,Mode | ConvertTo-Json -Compress" if windows else f"ls -la {'-R ' if args.get('recursive') else ''}-- {shlex.quote(path)}"
         elif action == "delete":
-            command = (f"Remove-Item -LiteralPath {ps_quote(path)} -Force -ErrorAction {'SilentlyContinue' if args.get('force') else 'Stop'}" if windows else f"rm {'-f ' if args.get('force') else ''}-- {shlex.quote(path)}")
+            if windows:
+                remove = (f"Remove-Item -LiteralPath {ps_quote(path)} -Force -Recurse -ErrorAction Stop" if args.get('recursive') else
+                          f"$f=Get-Item -Force -LiteralPath {ps_quote(path)} -ErrorAction Stop;if($f.PSIsContainer){{[IO.Directory]::Delete($f.FullName,$false)}}else{{Remove-Item -LiteralPath $f.FullName -Force -ErrorAction Stop}}")
+                command = (f"if(Test-Path -LiteralPath {ps_quote(path)} -ErrorAction Stop){{{remove}}}" if args.get('force') else remove)
+            else:
+                command = f"rm {'-r ' if args.get('recursive') else ''}{'-f ' if args.get('force') else ''}-- {shlex.quote(path)}"
+                if not args.get('recursive'):
+                    command = f"if [ -d {shlex.quote(path)} ] && [ ! -L {shlex.quote(path)} ]; then rmdir -- {shlex.quote(path)}; else {command}; fi"
         elif action == "search":
             query = str(args.get("query") or "")
             if not query:
                 raise BridgeError("invalid_arguments", "search requires query.")
-            command = (f"Get-ChildItem {'-Recurse ' if args.get('recursive') else ''}-File -LiteralPath {ps_quote(path)} | Select-String -SimpleMatch {ps_quote(query)}" if windows else f"grep {'-R ' if args.get('recursive') else ''}-n -F -- {shlex.quote(query)} {shlex.quote(path)}")
+            command = (f"Get-ChildItem {'-Recurse ' if args.get('recursive') else ''}-File -LiteralPath {ps_quote(path)} | Select-String -SimpleMatch {ps_quote(query)} -Encoding UTF8 -ErrorAction Stop" if windows else
+                       f"if grep {'-R ' if args.get('recursive') else ''}-n -F -- {shlex.quote(query)} {shlex.quote(path)}; then :; else ccm_grep_status=$?; [ \"$ccm_grep_status\" -eq 1 ] || exit \"$ccm_grep_status\"; fi")
         else:
             content = str(args.get("content") or "")
             encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
             if windows:
-                guard = "" if args.get("force") else f"if (Test-Path -LiteralPath {ps_quote(path)}) {{ throw 'Destination already exists' }};"
-                command = guard + f"$p=[IO.Path]::GetFullPath({ps_quote(path)});[IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($p))|Out-Null;[IO.File]::WriteAllBytes($p,[Convert]::FromBase64String('{encoded}'))"
+                mode = "Create" if args.get("force") else "CreateNew"
+                command = f"$p=[IO.Path]::GetFullPath({ps_quote(path)});[IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($p))|Out-Null;$b=[Convert]::FromBase64String('{encoded}');$f=[IO.File]::Open($p,[IO.FileMode]::{mode},[IO.FileAccess]::Write,[IO.FileShare]::None);try{{$f.Write($b,0,$b.Length)}}finally{{$f.Dispose()}}"
             else:
                 parent = str(pathlib.PurePosixPath(path).parent)
                 guard = "" if args.get("force") else "set -C;"
                 command = f"mkdir -p -- {shlex.quote(parent)} && ({guard}printf %s {shlex.quote(encoded)} | base64 -d > {shlex.quote(path)})"
         result = self._remote_command(item, command, {"timeout_ms": 120000, "execution_mode": "buffered", "output_limit_bytes": args.get("max_bytes", 32768)})
         return {"host": item["name"], "route": item["transport"], "action": action, "path": path, "result": result}
+
+    def _structured_file_args(self, action, args):
+        payload = {k: v for k, v in args.items() if k not in {"host", "action", "idempotency_key"}}
+        if action == "write":
+            if payload.pop("force", False):
+                raise BridgeError("invalid_arguments", "Structured file_add creates new files only; force overwrite requires a remote shell route or an explicit patch.")
+            encoding = payload.pop("encoding", "utf-8")
+            if encoding.lower().replace("_", "-") not in {"utf-8", "utf8"}:
+                raise BridgeError("invalid_arguments", "Structured writes support UTF-8 only.")
+        if action == "list":
+            if payload.pop("recursive", False) or "max_bytes" in payload:
+                raise BridgeError("invalid_arguments", "Structured list_dir supports offset/limit; recursive/max_bytes require a remote shell route.")
+        if action == "search":
+            if "max_bytes" in payload:
+                raise BridgeError("invalid_arguments", "Structured search_text uses max_results instead of max_bytes.")
+            if "recursive" in payload:
+                recursive = payload.pop("recursive")
+                if not recursive:
+                    if payload.get("max_depth", 1) != 1:
+                        raise BridgeError("invalid_arguments", "Nonrecursive search requires max_depth=1.")
+                    payload["max_depth"] = 1
+        return payload
