@@ -35,19 +35,27 @@ class Idempotency:
                     "execution_state_unknown",
                     "This call was already started or completed in an earlier process. It is not replayed.",
                 )
-            self.db.execute(
-                "INSERT INTO calls VALUES(?,?,?,?)", (kh, ah, "started", time.time())
-            )
-            self.db.commit()
+            try:
+                self.db.execute(
+                    "INSERT INTO calls VALUES(?,?,?,?)", (kh, ah, "started", time.time())
+                )
+                self.db.commit()
+            except BaseException:
+                self.db.rollback()
+                raise
         return None
 
     def finish(self, key, result):
         kh = digest(key)
         with self.lock:
-            self.db.execute(
-                "UPDATE calls SET state=? WHERE key_hash=?", ("complete", kh)
-            )
-            self.db.commit()
+            try:
+                self.db.execute(
+                    "UPDATE calls SET state=? WHERE key_hash=?", ("complete", kh)
+                )
+                self.db.commit()
+            except BaseException:
+                self.db.rollback()
+                raise
             self.cache[kh] = copy.deepcopy(result)
             if len(self.cache) > 256:
                 self.cache.pop(next(iter(self.cache)))

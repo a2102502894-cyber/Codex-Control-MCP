@@ -257,8 +257,9 @@ TOOL_SPECS = {
         True,
     ),
     "mcp_tool_call": definition(
-        "调用已发现的独立 MCP 工具；先按缓存 schema 校验 arguments，再转发到目标 MCP。",
-        {"name": {"type": "string", "minLength": 3}, "arguments": {"type": "object", "additionalProperties": True}},
+        "调用已发现的独立 MCP 工具；先按缓存 schema 校验 arguments，再转发到目标 MCP。续读必须保留 next_action 中的 expected_connection_digest；节点变更后明确拒绝，不重发原操作。",
+        {"name": {"type": "string", "minLength": 3}, "arguments": {"type": "object", "additionalProperties": True},
+         "expected_connection_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"}},
         ["name", "arguments"],
     ),
     "host_manage": definition(

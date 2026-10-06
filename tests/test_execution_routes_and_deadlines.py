@@ -368,7 +368,9 @@ def test_remote_mcp_session_is_polled_on_its_originating_node(tmp_path):
         assert out["ok"] and out["result"]["state"] == "running"
         next_action = out["result"]["next_action"]
         assert next_action["tool"] == "mcp_tool_call"
-        assert next_action["arguments"] == {"name": "node:session_read", "arguments": {"session_id": "remote-owned", "cursor": 2}}
+        assert next_action["arguments"]["name"] == "node:session_read"
+        assert next_action["arguments"]["arguments"] == {"session_id": "remote-owned", "cursor": 2}
+        assert len(next_action["arguments"]["expected_connection_digest"]) == 64
         direct = manager.call({"name": "node:exec_command", "arguments": {}})
         assert direct["next_action"] == next_action
     finally:

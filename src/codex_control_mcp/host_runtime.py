@@ -232,8 +232,10 @@ class HostManager:
             result = self.dynamic_mcp.call({"name": f"{item['mcp_server']}:exec_command", "arguments": forwarded})
             out = {"host": item["name"], "route": "dynamic_mcp", "result": result}
             action = execution_view(result).get("next_action")
-            if isinstance(result.get("next_action"), dict):
+            if "next_action" in result:
                 out["next_action"] = result["next_action"]
+                if result.get("continuation_unavailable"):
+                    out["continuation_unavailable"] = result["continuation_unavailable"]
             elif isinstance(action, dict) and action.get("tool") == "session_read":
                 out["next_action"] = {"tool": "mcp_tool_call", "arguments": {
                     "name": f"{item['mcp_server']}:session_read", "arguments": action.get("arguments") or {}}}

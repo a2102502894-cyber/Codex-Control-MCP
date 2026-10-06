@@ -464,7 +464,8 @@ class Bridge:
             output_truncation="observed" if result["output_truncated"] else "not_observed",
             status_message="命令仍在运行，请继续读取此会话并报告进度。" if running else "命令已结束，请检查退出码。",
             next_action={"tool": "session_read", "arguments": {
-                "session_id": session.id, "cursor": result["next_cursor"]
+                "session_id": session.id, "cursor": result["next_cursor"],
+                "max_bytes": a.get("output_limit_bytes", min(self.cfg.output_limit_bytes, 32768)), "output_format": "text",
             }} if running or result["has_more"] else None,
         )
         return result
@@ -1113,7 +1114,9 @@ class Bridge:
         risk = (
             "read" if tool in READ_TOOLS
             or (tool == "git_branch" and a.get("action", "list") == "list")
-            or (tool in {"host_manage", "mcp_manage"} and a.get("action") in {"list", "get"})
+            or (tool in {"host_manage", "mcp_manage", "task_manage"} and a.get("action") in {"list", "get"})
+            or (tool == "host_manage" and a.get("action") == "status")
+            or (tool == "skill_package" and a.get("action") in {"list", "inspect"})
             or (tool == "host_files" and a.get("action") in {"read", "list", "search"})
             else "dangerous" if tool in (
                 "exec_command", "session_start", "file_delete", "session_kill",
@@ -1142,7 +1145,7 @@ class Bridge:
             else:
                 self.audit.emit("tool_start", tool=tool, risk_level=risk, param_keys=sorted(a))
                 trace.mark("bridge_dispatch")
-                if tool in FILE_WRITES and not (tool == "host_files" and a.get("action") in {"read", "list", "search"}):
+                if tool in FILE_WRITES and not (risk == "read" and tool in {"host_files", "host_manage", "mcp_manage", "task_manage"}):
                     with self.write_lock:
                         data = self._do(tool, a)
                 else:

@@ -189,7 +189,7 @@ class Session:
             running = self.state in {"starting", "running"}
             result.update(completed=not running, output_format=output_format, page_bytes=size,
                           status_message="命令仍在运行，请继续读取会话。" if running else "命令已结束，请检查退出码和错误状态。",
-                          next_action={"tool": "session_read", "arguments": {"session_id": self.id, "cursor": next_cursor}} if running or result["has_more"] else None)
+                          next_action={"tool": "session_read", "arguments": {"session_id": self.id, "cursor": next_cursor, "max_bytes": max_bytes, "output_format": output_format}} if running or result["has_more"] else None)
             return result
 
 
@@ -236,11 +236,16 @@ class SessionStore:
                 for k, s in self.items.items()
                 if s.state not in ("starting", "running")
             ]
+            before = dict(self.items)
             for k in old[: -self.max_sessions]:
                 self.items.pop(k, None)
             s = Session("s_" + uuid.uuid4().hex, generation, cwd, self.capacity, tty)
             self.items[s.id] = s
-            self.save()
+            try:
+                self.save()
+            except BaseException:
+                self.items = before
+                raise
             return s
 
     def get(self, id, generation=None):

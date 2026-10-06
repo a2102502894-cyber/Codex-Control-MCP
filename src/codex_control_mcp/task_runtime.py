@@ -180,14 +180,17 @@ class RecoverableTaskStore:
         task["updated_at"] = utc_now()
         task["events"] = list(task.get("events") or [])[-256:]
         raw = json.dumps(task, ensure_ascii=False, separators=(",", ":"))
-        cursor = self.db.execute(
-            "UPDATE tasks SET status=?,updated_at=?,doc=? WHERE id=? AND doc=?",
-            (task["status"], task["updated_at"], raw, task["id"], row[0]),
-        )
-        if cursor.rowcount != 1:
+        try:
+            cursor = self.db.execute(
+                "UPDATE tasks SET status=?,updated_at=?,doc=? WHERE id=? AND doc=?",
+                (task["status"], task["updated_at"], raw, task["id"], row[0]),
+            )
+            if cursor.rowcount != 1:
+                raise BridgeError("task_revision_conflict", "Task changed since it was read.")
+            self.db.commit()
+        except BaseException:
             self.db.rollback()
-            raise BridgeError("task_revision_conflict", "Task changed since it was read.")
-        self.db.commit()
+            raise
         return copy.deepcopy(task)
 
     def create(self, args):
@@ -239,11 +242,15 @@ class RecoverableTaskStore:
             "completed_at": None,
         }
         with self.lock:
-            self.db.execute(
-                "INSERT INTO tasks(id,status,updated_at,doc) VALUES(?,?,?,?)",
-                (task["id"], task["status"], now, json.dumps(task, ensure_ascii=False, separators=(",", ":"))),
-            )
-            self.db.commit()
+            try:
+                self.db.execute(
+                    "INSERT INTO tasks(id,status,updated_at,doc) VALUES(?,?,?,?)",
+                    (task["id"], task["status"], now, json.dumps(task, ensure_ascii=False, separators=(",", ":"))),
+                )
+                self.db.commit()
+            except BaseException:
+                self.db.rollback()
+                raise
         return self._receipt("create", task)
 
     def list(self, args):

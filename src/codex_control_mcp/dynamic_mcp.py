@@ -11,6 +11,7 @@ import threading
 import subprocess
 import sys
 import urllib.parse
+import uuid
 
 import httpx
 from jsonschema import Draft7Validator
@@ -20,7 +21,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamable_http_client
 
-from .common import atomic_json, utc_now
+from .common import atomic_json, utc_now, digest
 from .errors import BridgeError
 from .results import execution_view
 
@@ -34,7 +35,7 @@ def validation_argv():
     # Frozen applications are not Python interpreters. Both distributions use
     # the same worker, before configuration/authentication/service startup.
     return ([sys.executable, "--internal-validate-mcp-arguments"] if getattr(sys, "frozen", False) else
-            [sys.executable, "-I", "-m", "codex_control_mcp.schema_worker"])
+            [sys.executable, "-I", str(pathlib.Path(__file__).with_name("schema_worker.py").resolve())])
 
 
 class DynamicMCPManager:
@@ -66,6 +67,13 @@ class DynamicMCPManager:
                 self.servers = copy.deepcopy(self._persisted)
                 raise
             self._persisted = copy.deepcopy(self.servers)
+
+    @staticmethod
+    def _connection_digest(item):
+        return digest({key: item.get(key) for key in (
+            "name", "connection_id", "transport", "url", "command", "args", "cwd",
+            "headers", "header_files", "header_prefixes", "env", "env_from_env", "env_files",
+        )})
 
     def _name(self, value):
         value = str(value or "").strip()
@@ -142,6 +150,8 @@ class DynamicMCPManager:
             item["args"] = list(arguments)
             item["cwd"] = str(args.get("cwd", item.get("cwd", "")) or "").strip()
             item["url"] = ""
+        # Persist a connection epoch, including replacement with identical settings.
+        item["connection_id"] = uuid.uuid4().hex
         item.setdefault("tools", [])
         item.setdefault("status", "never_refreshed")
         item.setdefault("last_error", "")
@@ -328,6 +338,7 @@ class DynamicMCPManager:
             if key not in self.servers:
                 raise BridgeError("mcp_not_found", "Dynamic MCP server was not found.")
             self.servers[key]["enabled"] = action == "enable"
+            self.servers[key]["connection_id"] = uuid.uuid4().hex
             if action == "disable":
                 self.servers[key]["status"] = "disabled"
             self._save()
@@ -401,6 +412,9 @@ class DynamicMCPManager:
         item = self.servers.get(server)
         if not item or not item.get("enabled", True):
             raise BridgeError("mcp_unavailable", "Dynamic MCP server is absent or disabled.")
+        expected = args.get("expected_connection_digest")
+        if expected is not None and expected != self._connection_digest(item):
+            raise BridgeError("mcp_registry_changed", "The continuation belongs to an earlier connection; no tool was executed.")
         tool = next((t for t in self._cached_tools(item) if t.get("name") == tool_name), None)
         if not tool:
             raise BridgeError("mcp_tool_not_found", "Dynamic MCP tool was not found in the latest schema.")
@@ -432,10 +446,35 @@ class DynamicMCPManager:
             result = await session.call_tool(tool_name, arguments)
             return result.model_dump(mode="json", by_alias=True, exclude_none=True)
 
-        result = self._run(item, invoke, mutating=True)
+        # Accept one immutable connection only after its schema validation.
+        # Updates during validation must not dispatch to the superseded node.
+        with self._registry_lock:
+            if (self.servers.get(server) is not item or not item.get("enabled", True)
+                    or not any(cached is tool for cached in item.get("tools") or [])):
+                raise BridgeError("mcp_registry_changed", "Server configuration or tool cache changed during validation; no tool was executed.")
+            connection = copy.deepcopy(item)
+            connection_digest = self._connection_digest(connection)
+            next_tools = {t.get("name") for t in connection.get("tools") or []}
+        result = self._run(connection, invoke, mutating=True)
         out = {"qualified_name": f"{server}:{tool_name}", "result": result}
         action = execution_view(result).get("next_action")
-        if isinstance(action, dict) and action.get("tool") in {t.get("name") for t in self._cached_tools(item)}:
-            out["next_action"] = {"tool": "mcp_tool_call", "arguments": {
-                "name": f"{server}:{action['tool']}", "arguments": action.get("arguments") or {}}}
+        if isinstance(action, dict):
+            with self._registry_lock:
+                available = (self.servers.get(server) is item and item.get("enabled", True)
+                             and self._connection_digest(item) == connection_digest)
+            malformed = (not isinstance(action.get("tool"), str)
+                         or not isinstance(action.get("arguments", {}), dict))
+            if not available or malformed or action.get("tool") not in next_tools:
+                # Preserve an already executed operation's result. Never turn a
+                # remote continuation into a local call or another node's call.
+                out["next_action"] = None
+                out["continuation_unavailable"] = {
+                    "code": "mcp_registry_changed" if not available else ("mcp_continuation_invalid" if malformed else "mcp_tool_not_found"),
+                    "message": "The result is preserved, but its continuation cannot be routed safely; do not replay the original operation.",
+                    "automatic_retry_performed": False,
+                }
+            else:
+                out["next_action"] = {"tool": "mcp_tool_call", "arguments": {
+                    "name": f"{server}:{action['tool']}", "arguments": action.get("arguments") or {},
+                    "expected_connection_digest": connection_digest}}
         return out
