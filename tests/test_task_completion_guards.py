@@ -76,7 +76,7 @@ def test_progress_and_resume_invalidate_review(store, change):
         raises_code("task_blocked", lambda: store.complete({"task_id": task_id}))
         store.resume({"task_id": task_id, "summary": "Service restored"})
     else:
-        store.resume({"task_id": task_id})
+        store.resume({"task_id": task_id, "summary": "New evidence requires renewed review"})
     current = store.get({"task_id": task_id})
     assert current["task"]["final_review"] is None
     assert current["continuation_required"] and not current["task_completed"]

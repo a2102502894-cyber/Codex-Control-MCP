@@ -7,12 +7,14 @@ import pathlib
 import sqlite3
 import threading
 import uuid
+from datetime import datetime, timezone
 
 from .common import utc_now
 from .errors import BridgeError
 
 TASK_STATUSES = {"active", "blocked", "completed"}
 STEP_STATUSES = {"pending", "in_progress", "completed"}
+INACTIVITY_OBSERVATION_SECONDS = 180
 
 
 def _txt(value, field, required=False, limit=16384):
@@ -65,6 +67,13 @@ class RecoverableTaskStore:
         conditions = task.get("completion_conditions") or []
         unverified = [c for c in conditions if c not in verified]
         current_review = self._review_current(task)
+        try:
+            last_update = datetime.fromisoformat(task["updated_at"].replace("Z", "+00:00"))
+            idle_seconds = max(0, int((datetime.now(timezone.utc) - last_update).total_seconds()))
+        except (KeyError, TypeError, ValueError, OverflowError):
+            idle_seconds = None
+        suspected_interruption = (task["status"] == "active" and idle_seconds is not None
+                                  and idle_seconds >= INACTIVITY_OBSERVATION_SECONDS)
         if task["status"] == "completed":
             next_required = "The recorded task is complete; report verified results and scope."
         elif task["status"] == "blocked":
@@ -98,6 +107,20 @@ class RecoverableTaskStore:
             "task_completed": task["status"] == "completed",
             "continuation_required": task["status"] == "active",
             "next_required_action": next_required,
+            "continuation_observation": {
+                "checkpoint_idle_seconds": idle_seconds,
+                "suspected_interruption": suspected_interruption,
+                "threshold_seconds": INACTIVITY_OBSERVATION_SECONDS,
+                "last_checkpoint_at": task.get("updated_at"),
+                "next_step_id": remaining[0] if remaining else None,
+                "client_model_state": "not_observable",
+                "running_process_state": "not_checked",
+                "safe_recovery": (
+                    "Inspect original command/session receipts and logs before running remaining steps; "
+                    "never assume that a silent client stopped an already launched process."
+                    if task["status"] == "active" else None
+                ),
+            },
         }
 
     @staticmethod
@@ -365,6 +388,11 @@ class RecoverableTaskStore:
             if task["status"] == "completed":
                 raise BridgeError("task_completed", "Completed tasks cannot be resumed.")
             summary = _txt(args.get("summary"), "summary", False, 8192)
+            self._check_revision(task, args.get("expected_revision"))
+            if task["status"] == "active" and not summary:
+                # Re-entry after client silence must not invalidate the final review.
+                return self._receipt("resume", task, already_active=True,
+                                     execution_restarted=False)
             task["status"] = "active"
             task["blocker"] = ""
             if summary:
@@ -373,7 +401,7 @@ class RecoverableTaskStore:
             self._invalidate_review(task, "Task resumed; review the current state again.")
             self._sync_phase(task)
             saved = self._save(task, args.get("expected_revision"))
-        return self._receipt("resume", saved)
+        return self._receipt("resume", saved, execution_restarted=False)
 
     def final_review(self, args):
         review_status = _txt(args.get("review_status"), "review_status", True, 64).lower()
