@@ -43,7 +43,9 @@ def promote_execution(data):
     view = execution_view(data)
     for key in ("session_id", "origin_operation_id", "runtime_generation", "state", "exit_code", "completed",
                 "next_cursor", "has_more", "next_action", "effective_timeout_ms", "elapsed_ms", "status_message",
-                "output_truncated", "dropped_output_bytes", "output_truncation"):
+                "output_truncated", "dropped_output_bytes", "output_truncation", "process_completed",
+                "continuation_required", "final_receipt_ready", "output_complete", "result_status",
+                "heartbeat", "history_only", "recovery_warning", "read_action"):
         if key in view:
             data.setdefault(key, view[key])
     return data

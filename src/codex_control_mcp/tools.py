@@ -71,11 +71,11 @@ TOOL_SPECS = {
         EXEC,
     ),
     "session_start": definition(
-        "通过官方执行层启动流式长任务。timeout_ms=0 明确禁用底层期限。", SESSION
+        "通过官方执行层启动流式长任务，立即返回首批输出和 next_action；必须从返回的游标继续读取，直到 continuation_required=false，并核对 final_receipt_ready、退出码和数据缺口。timeout_ms=0 明确禁用底层期限。", SESSION
     ),
     "session_read": definition(
-        "按游标读取会话，默认返回 32 KiB 文本、运行状态和下一次游标；running 必须继续轮询。output_format 可选 text、chunks、raw（原始 Base64）、legacy（旧完整字段）。报告截断和数据缺口。",
-        {"session_id": S, "cursor": integer(0, 9007199254740991), "max_bytes": integer(1024, 4194304), "output_format": enum("text", "chunks", "raw", "legacy")},
+        "按游标读取会话，默认 32 KiB 文本。无新输出时最多等待 10 秒，输出或结束立即唤醒；wait_ms=0 可立即查询。每次带独立 heartbeat，静默不代表卡死。continuation_required=true 必须继续按 next_action 读取，进程退出但还有输出时 completed=false；取完后核对 final_receipt_ready、退出码和缺口，并立即交回结果。可恢复历史退出状态，但重启前的输出须查原日志，不能重发命令。output_format 支持 text、chunks、raw、legacy。",
+        {"session_id": S, "cursor": integer(0, 9007199254740991), "max_bytes": integer(1024, 4194304), "output_format": enum("text", "chunks", "raw", "legacy"), "wait_ms": integer(0, 10000)},
         ["session_id"],
         True,
     ),
@@ -95,7 +95,7 @@ TOOL_SPECS = {
         ["session_id", "rows", "cols"],
     ),
     "session_list": definition(
-        "仅列本桥当前和历史会话，不枚举 Desktop 私有线程。", {}, read=True
+        "仅列本桥当前和历史会话，不枚举 Desktop 私有线程。恢复会话优先用 read_action 从头读取；列表的 next_cursor 仅是流末尾位置，不能据此跳过未接收输出。历史会话只恢复状态，不重连或重新执行进程。", {}, read=True
     ),
     "read_file": definition(
         "经官方执行层有界读取文件；返回内容 SHA-256、行范围、截断及 next_action。超长行用 next_utf8_offset 续读（解码文本的 UTF-8 字节位置），须带 expected_sha256，不能同时指定 start_line/end_line。",

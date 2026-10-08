@@ -441,7 +441,9 @@ class Bridge:
             raise BridgeError(s.error["code"], s.error["message"],
                               retryable=s.error.get("retryable", False),
                               details=s.error.get("details", {}))
-        return s.metadata()
+        # Return the first output page with its continuation cursor. Returning
+        # metadata.next_cursor here skips output produced during dispatch.
+        return s.read(max_bytes=a.get("output_limit_bytes", min(self.cfg.output_limit_bytes, 32768)), output_format="text")
 
     def _command_auto(self, a):
         """Dispatch once, then yield a resumable receipt rather than hiding output."""
@@ -455,18 +457,11 @@ class Bridge:
                               retryable=result["error"].get("retryable", False),
                               details={**result["error"].get("details", {}),
                                        "session_id": session.id})
-        running = result["state"] in ("starting", "running")
         result.update(
             execution_backend="codex_app_server.command_exec",
             effective_sandbox="dangerFullAccess",
-            completed=not running,
             output_limit_bytes=a.get("output_limit_bytes", min(self.cfg.output_limit_bytes, 32768)),
             output_truncation="observed" if result["output_truncated"] else "not_observed",
-            status_message="命令仍在运行，请继续读取此会话并报告进度。" if running else "命令已结束，请检查退出码。",
-            next_action={"tool": "session_read", "arguments": {
-                "session_id": session.id, "cursor": result["next_cursor"],
-                "max_bytes": a.get("output_limit_bytes", min(self.cfg.output_limit_bytes, 32768)), "output_format": "text",
-            }} if running or result["has_more"] else None,
         )
         return result
 
@@ -587,7 +582,7 @@ class Bridge:
             # Cached output remains readable even if Codex is uninstalled,
             # disconnected or waiting for a compatible update.
             s = self.sessions.get(a["session_id"])
-            return s.read(a.get("cursor", 0), a.get("max_bytes", 32768), a.get("output_format", "text"))
+            return s.read(a.get("cursor", 0), a.get("max_bytes", 32768), a.get("output_format", "text"), a.get("wait_ms", 10000))
         if tool in ("session_write", "session_kill", "session_resize"):
             self.ensure_ready()
             s = self.sessions.get(a["session_id"], self.rpc.generation)
@@ -1151,7 +1146,7 @@ class Bridge:
                 else:
                     data = self._do(tool, a)
                 process_tools = {
-                    "exec_command", "session_read", "file_patch", "git_commit",
+                    "exec_command", "session_start", "session_read", "file_patch", "git_commit",
                     "git_branch", "git_status", "git_diff", "git_log",
                     "search_files", "search_text",
                     "host_exec", "host_files", "mcp_tool_call",

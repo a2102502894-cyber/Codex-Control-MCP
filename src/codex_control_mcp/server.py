@@ -1,5 +1,5 @@
 from __future__ import annotations
-import asyncio, json, os, sys, uuid
+import asyncio, json, os, sys, time, uuid
 import anyio
 from mcp import types
 from mcp.server.lowlevel import Server
@@ -35,13 +35,27 @@ async def execute_with_progress(bridge, context, name, arguments):
             progress_observation["failed_or_timed_out"] += 1
             # A disconnected progress consumer must not replay the action.
 
+    def progress_message(elapsed):
+        if name == "session_read" and isinstance(arguments, dict):
+            try:
+                state = bridge.sessions.get(arguments["session_id"]).metadata()
+                if state["state"] == "exited":
+                    return "进程已结束，正在返回剩余输出与最终退出码。"
+                if state["state"] in {"lost", "failed"}:
+                    return "会话结果出现异常，正在返回已知状态；不会自动重发原命令。"
+                idle = state["heartbeat"].get("output_idle_ms") or 0
+                return f"正在等待同一会话的最终结果；已等待约 {state['elapsed_ms'] / 1000:.1f} 秒，最近约 {idle / 1000:.1f} 秒无终端输出。"
+            except Exception:
+                pass  # Progress observation must not replace the actual result.
+        return "正在执行工具，请稍候。" if elapsed == 0 else f"工具仍在执行，已等待约 {elapsed:.1f} 秒。"
+
     async def heartbeat():
-        elapsed = 0
-        await notify(0, "正在执行工具，请稍候。")
+        started = time.monotonic()
+        await notify(0, progress_message(0))
         while True:
             await asyncio.sleep(PROGRESS_INTERVAL_SECONDS)
-            elapsed += PROGRESS_INTERVAL_SECONDS
-            await notify(elapsed, f"工具仍在执行，已等待约 {elapsed:g} 秒。")
+            elapsed = time.monotonic() - started
+            await notify(elapsed, progress_message(elapsed))
 
     task = asyncio.create_task(heartbeat()) if progress_token is not None else None
     operation_id = uuid.uuid4().hex
@@ -95,8 +109,19 @@ def make_server(bridge):
             "Use expected_revision for updates. A passing review is not completion: call complete and verify "
             "task_completed=true before reporting the goal achieved. Changes after review require a new review. "
             "exec_command defaults to auto: running is NOT completion. Poll session_read using session_id "
-            "and next_cursor until a final exit code; report meaningful progress and never resubmit the same "
-            "command because output is absent. Use computer_close in finally after each desktop workflow; "
+            "and the complete next_action until continuation_required=false. A process exit is not full "
+            "receipt delivery while has_more=true: drain every output page, check final_receipt_ready, "
+            "exit_code and output gaps, then immediately report results and continue remaining user work. "
+            "session_start also returns an initial output page; consume it before continuation. "
+            "session_read waits at most 10 seconds for new output or exit and returns a heartbeat even "
+            "for silent programs. With progressToken, the active poll request also receives progress. "
+            "A heartbeat observes the bridge session, not proof of application-level progress. "
+            "Report meaningful progress at least every 60 seconds during long work, even when program "
+            "output is redirected to a task log; retain the log path and final exit status in checkpoints. "
+            "Recover listed sessions using read_action; metadata.next_cursor alone is the stream end. "
+            "Historical exit status may survive restart, but missing cached output must be verified "
+            "from the original task log. Never resubmit a command because output or its response is absent. "
+            "Use computer_close in finally after each desktop workflow; "
             "the bridge also releases idle control after 120 seconds. A new workflow needs a fresh snapshot. "
             "Commands run as the service account with dangerFullAccess. No model turns are started by this server; "
             "task state and continuation guidance cannot intercept a client's final reply or restart its model loop."
